@@ -169,6 +169,19 @@ func (UserMessage) isMessage()       {}
 func (AssistantMessage) isMessage()  {}
 func (ToolResultMessage) isMessage() {}
 
+// AgentMessageType returns the message type as a string for use in the agent loop.
+func (UserMessage) AgentMessageType() string {
+	return string(RoleUser)
+}
+
+func (AssistantMessage) AgentMessageType() string {
+	return string(RoleAssistant)
+}
+
+func (ToolResultMessage) AgentMessageType() string {
+	return string(RoleToolResult)
+}
+
 type Tool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`

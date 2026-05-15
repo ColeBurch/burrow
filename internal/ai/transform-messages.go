@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"slices"
 	"strings"
 	"time"
 
@@ -56,7 +57,7 @@ func ReplaceToolResultImagesWithPlaceholder(content []ToolResultContent, placeho
 }
 
 func downgradeUnsupportedImages(messages []Message, model Model[API]) []Message {
-	if strings.Contains(model.Input, "image") {
+	if slices.Contains(model.Input, "image") {
 		return messages
 	}
 
@@ -155,7 +156,7 @@ func TransformMessages(messages []Message, model Model[API], allowedToolCallProv
 						toolCall.ThoughtSignature = nil
 					}
 
-					if !isSameModel && normalizeToolCallID != nil {
+					if !isSameModel {
 						normalizedID := normalizeToolCallID(toolCall.Id, model, assistantMsg, allowedToolCallProviders)
 						if normalizedID != toolCall.Id {
 							toolCallIdMap[toolCall.Id] = normalizedID

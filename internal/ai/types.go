@@ -43,11 +43,12 @@ type ImageContent struct {
 }
 
 type ToolCall struct {
-	Type             ContentType `json:"type"`
-	Id               string      `json:"id"`
-	Name             string      `json:"name"`
-	Args             any         `json:"args"`
-	ThoughtSignature *string     `json:"thoughtSignature,omitempty"`
+	Type             ContentType    `json:"type"`
+	Id               string         `json:"id"`
+	Name             string         `json:"name"`
+	Args             map[string]any `json:"args"`
+	ThoughtSignature *string        `json:"thoughtSignature,omitempty"`
+	PartialJson      *string        `json:"partialJson,omitempty"`
 }
 
 type UserContent interface {
@@ -201,7 +202,7 @@ func (TextStartEvent) EventType() string { return "text_start" }
 
 type TextDeltaEvent struct {
 	Type         string           `json:"type"`
-	ContentIndex int              `json:"contentIndex"`
+	ContentIndex int64            `json:"contentIndex"`
 	Delta        string           `json:"delta"`
 	Partial      AssistantMessage `json:"partial"`
 }
@@ -263,7 +264,7 @@ func (ToolCallDeltaEvent) EventType() string { return "toolcall_delta" }
 type ToolCallEndEvent struct {
 	Type         string           `json:"type"`
 	ContentIndex int64            `json:"contentIndex"`
-	Content      string           `json:"content"`
+	ToolCall     ToolCall         `json:"toolCall"`
 	Partial      AssistantMessage `json:"partial"`
 }
 
@@ -363,7 +364,7 @@ type Model[tApi API] struct {
 	BaseURL          string                 `json:"base_url"`
 	Reasoning        bool                   `json:"reasoning"`
 	ThinkingLevelMap ThinkingLevelMap       `json:"thinking_level_map"`
-	Input            string                 `json:"input"`
+	Input            []string               `json:"input"`
 	Cost             Cost                   `json:"cost"` // $/million tokens
 	ContextWindow    int                    `json:"context_window"`
 	MaxTokens        int                    `json:"max_tokens"`

@@ -76,6 +76,16 @@ type ConvertResponseMessagesOptions struct {
 	IncludeSystemPrompt *bool `json:"includeSystemPrompt,omitempty"`
 }
 
+type responsesStreamProcessor struct {
+	output *AssistantMessage
+	stream *AssistantMessageEventStream
+
+	currentContentIndex int
+	currentItemType     string
+
+	currentParts []responses.ResponseStreamEventUnionPart
+}
+
 func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext ModelContext, options *OpenAIResponseOptions) (*AssistantMessageEventStream, error) {
 	stream := NewAssistantMessageEventStream(16)
 
@@ -124,16 +134,42 @@ func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext Mo
 	}
 
 	openaiStream := client.Responses.NewStreaming(ctx, params)
-	stream.Push(StartEvent{Type: "start", Partial: output})
 
-	for openaiStream.Next() {
-		_ = openaiStream.Current()
-
+	processor := &responsesStreamProcessor{
+		output: &output,
+		stream: stream,
 	}
 
-	if openaiStream.Err() != nil {
-		panic(openaiStream.Err())
-	}
+	processor.currentContentIndex = -1
+	processor.stream.Push(StartEvent{Type: "start", Partial: output})
+
+	go func() {
+		sentTerminalEvent := false
+		for openaiStream.Next() {
+			event := openaiStream.Current()
+			processor.ProcessResponsesStream(event, model, options)
+		}
+
+		if err := openaiStream.Err(); err != nil {
+			output.StopReason = StopReasonError
+			output.ErrorMessage = err.Error()
+
+			stream.Push(ErrorEvent{
+				Type:    "error",
+				Message: output,
+			})
+		}
+
+		if !sentTerminalEvent {
+			output.StopReason = StopReasonError
+			output.ErrorMessage = "OpenAI stream ended without terminal event"
+
+			stream.Push(ErrorEvent{
+				Type:    "error",
+				Message: output,
+			})
+		}
+	}()
 
 	return stream, nil
 }
@@ -525,12 +561,519 @@ func ParseTextSignature(signature *string) *ParsedTextSignature {
 	}
 }
 
-func ProcessResponsesStream(
-	openAIStream responses.ResponseStreamEventUnion,
-	output AssistantMessage,
-	stream AssistantMessageEventStream,
+func EncodeTextSignatureV1(id string, phase *TextSignaturePhase) string {
+	payload := textSignatureV1{
+		V:     1,
+		ID:    id,
+		Phase: phase,
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return id
+	}
+
+	return string(data)
+}
+
+func MapOpenAIResponseStopReason(status responses.ResponseStatus) (StopReason, error) {
+	switch string(status) {
+	case "completed":
+		return StopReasonStop, nil
+	case "incomplete":
+		return StopReasonLength, nil
+	case "failed":
+		return StopReasonError, nil
+	case "cancelled":
+		return StopReasonAborted, nil
+	case "in_progress":
+		return StopReasonStop, nil
+	case "queued":
+		return StopReasonStop, nil
+	default:
+		return StopReasonError, fmt.Errorf("Unhandled stop reason: %s", string(status))
+	}
+}
+
+func (p *responsesStreamProcessor) ProcessResponsesStream(
+	event responses.ResponseStreamEventUnion,
 	model Model[API],
 	options *OpenAIResponseOptions,
 ) {
+	switch event.Type {
+	case "response.created":
+		p.output.ResponseID = &event.Response.ID
 
+	case "response.output_item.added":
+		item := event.Item
+
+		switch item.Type {
+		case "reasoning":
+			block := ThinkingContent{
+				Type:     ContentTypeThinking,
+				Thinking: "",
+			}
+
+			p.output.Content = append(p.output.Content, block)
+			p.currentContentIndex = len(p.output.Content) - 1
+			p.currentItemType = "reasoning"
+			p.currentParts = nil
+
+			p.stream.Push(ThinkingStartEvent{
+				Type:         "thinking_start",
+				ContentIndex: int64(p.currentContentIndex),
+				Partial:      *p.output,
+			})
+
+		case "message":
+			block := TextContent{
+				Type: ContentTypeText,
+				Text: "",
+			}
+
+			p.output.Content = append(p.output.Content, block)
+			p.currentContentIndex = len(p.output.Content) - 1
+			p.currentItemType = "message"
+			p.currentParts = nil
+
+			p.stream.Push(TextStartEvent{
+				Type:         "text_start",
+				ContentIndex: int64(p.currentContentIndex),
+				Partial:      *p.output,
+			})
+
+		case "function_call":
+			partialJSON := item.Arguments.OfString
+
+			block := ToolCall{
+				Type:        ContentTypeToolCall,
+				Id:          fmt.Sprintf("%s|%s", item.CallID, item.ID),
+				Name:        item.Name,
+				Args:        map[string]any{},
+				PartialJson: &partialJSON,
+			}
+
+			p.output.Content = append(p.output.Content, block)
+			p.currentContentIndex = len(p.output.Content) - 1
+			p.currentItemType = "function_call"
+
+			p.stream.Push(ToolCallStartEvent{
+				Type:         "toolcall_start",
+				ContentIndex: int64(p.currentContentIndex),
+				Partial:      *p.output,
+			})
+		}
+	case "response.reasoning_summary_part.added":
+		if p.currentItemType == "reasoning" {
+			p.currentParts = append(p.currentParts, event.Part)
+		}
+	case "response.reasoning_summary_text.delta":
+		if p.currentItemType != "reasoning" || p.currentContentIndex < 0 {
+			return
+		}
+
+		if len(p.currentParts) == 0 {
+			return
+		}
+
+		block, ok := p.output.Content[p.currentContentIndex].(ThinkingContent)
+		if !ok {
+			return
+		}
+
+		block.Thinking += event.Delta
+		p.output.Content[p.currentContentIndex] = block
+
+		last := &p.currentParts[len(p.currentParts)-1]
+		last.Text += event.Delta
+
+		p.stream.Push(ThinkingDeltaEvent{
+			Type:         "thinking_delta",
+			ContentIndex: int64(p.currentContentIndex),
+			Delta:        event.Delta,
+			Partial:      *p.output,
+		})
+	case "response.reasoning_summary_part.done":
+		if p.currentItemType != "reasoning" || p.currentContentIndex < 0 {
+			return
+		}
+
+		if len(p.currentParts) == 0 {
+			return
+		}
+
+		block, ok := p.output.Content[p.currentContentIndex].(ThinkingContent)
+		if !ok {
+			return
+		}
+
+		delta := "\n\n"
+
+		block.Thinking += delta
+		p.output.Content[p.currentContentIndex] = block
+
+		last := &p.currentParts[len(p.currentParts)-1]
+		last.Text += delta
+
+		p.stream.Push(ThinkingDeltaEvent{
+			Type:         "thinking_delta",
+			ContentIndex: int64(p.currentContentIndex),
+			Delta:        delta,
+			Partial:      *p.output,
+		})
+	case "response.content_part.added":
+		if p.currentItemType == "message" {
+			p.currentParts = append(p.currentParts, event.Part)
+		}
+	case "response.output_text.delta":
+		if p.currentItemType != "message" || p.currentContentIndex < 0 {
+			return
+		}
+
+		if len(p.currentParts) == 0 {
+			return
+		}
+
+		lastPart := &p.currentParts[len(p.currentParts)-1]
+		if lastPart.Type != "output_text" {
+			return
+		}
+
+		block, ok := p.output.Content[p.currentContentIndex].(TextContent)
+		if !ok {
+			return
+		}
+
+		block.Text += event.Delta
+		p.output.Content[p.currentContentIndex] = block
+
+		lastPart.Text += event.Delta
+
+		p.stream.Push(TextDeltaEvent{
+			Type:         "text_delta",
+			ContentIndex: int64(p.currentContentIndex),
+			Delta:        event.Delta,
+			Partial:      *p.output,
+		})
+	case "response.refusal.delta":
+		if p.currentItemType != "message" || p.currentContentIndex < 0 {
+			return
+		}
+
+		if len(p.currentParts) == 0 {
+			return
+		}
+
+		lastPart := &p.currentParts[len(p.currentParts)-1]
+		if lastPart.Type != "refusal" {
+			return
+		}
+
+		block, ok := p.output.Content[p.currentContentIndex].(TextContent)
+		if !ok {
+			return
+		}
+
+		block.Text += event.Delta
+		p.output.Content[p.currentContentIndex] = block
+
+		lastPart.Refusal += event.Delta
+
+		p.stream.Push(TextDeltaEvent{
+			Type:         "text_delta",
+			ContentIndex: int64(p.currentContentIndex),
+			Delta:        event.Delta,
+			Partial:      *p.output,
+		})
+	case "response.function_call_arguments.delta":
+		if p.currentItemType != "function_call" || p.currentContentIndex < 0 {
+			return
+		}
+
+		block, ok := p.output.Content[p.currentContentIndex].(ToolCall)
+		if !ok {
+			return
+		}
+
+		partialJSON := ""
+		if block.PartialJson != nil {
+			partialJSON = *block.PartialJson
+		}
+
+		partialJSON += event.Delta
+		block.PartialJson = &partialJSON
+
+		//Will fail until full valid JSON is received
+		var args map[string]any
+		if err := json.Unmarshal([]byte(partialJSON), &args); err == nil {
+			block.Args = args
+		}
+
+		p.output.Content[p.currentContentIndex] = block
+
+		p.stream.Push(ToolCallDeltaEvent{
+			Type:         "toolcall_delta",
+			ContentIndex: int64(p.currentContentIndex),
+			Delta:        event.Delta,
+			Partial:      *p.output,
+		})
+	case "response.function_call_arguments.done":
+		if p.currentItemType != "function_call" || p.currentContentIndex < 0 {
+			return
+		}
+
+		block, ok := p.output.Content[p.currentContentIndex].(ToolCall)
+		if !ok {
+			return
+		}
+
+		previousPartialJSON := ""
+		if block.PartialJson != nil {
+			previousPartialJSON = *block.PartialJson
+		}
+
+		block.PartialJson = &event.Arguments
+
+		var args map[string]any
+		if err := json.Unmarshal([]byte(event.Arguments), &args); err == nil {
+			block.Args = args
+		}
+
+		p.output.Content[p.currentContentIndex] = block
+
+		if strings.HasPrefix(event.Arguments, previousPartialJSON) {
+			delta := event.Arguments[len(previousPartialJSON):]
+			if delta != "" {
+				p.stream.Push(ToolCallDeltaEvent{
+					Type:         "toolcall_delta",
+					ContentIndex: int64(p.currentContentIndex),
+					Delta:        delta,
+					Partial:      *p.output,
+				})
+			}
+		}
+	case "response.output_item.done":
+		item := event.Item
+
+		switch item.Type {
+		case "reasoning":
+			if p.currentContentIndex < 0 {
+				return
+			}
+
+			block, ok := p.output.Content[p.currentContentIndex].(ThinkingContent)
+			if !ok {
+				return
+			}
+
+			parts := make([]string, 0, len(item.Summary))
+			for _, summary := range item.Summary {
+				parts = append(parts, summary.Text)
+			}
+
+			block.Thinking = strings.Join(parts, "\n\n")
+
+			signatureBytes, err := json.Marshal(item)
+			if err == nil {
+				signature := string(signatureBytes)
+				block.ThinkingSignature = &signature
+			}
+
+			p.output.Content[p.currentContentIndex] = block
+
+			p.stream.Push(ThinkingEndEvent{
+				Type:         "thinking_end",
+				ContentIndex: int64(p.currentContentIndex),
+				Content:      block.Thinking,
+				Partial:      *p.output,
+			})
+
+			p.currentContentIndex = -1
+			p.currentItemType = ""
+			p.currentParts = nil
+		case "message":
+			if p.currentContentIndex < 0 {
+				return
+			}
+
+			block, ok := p.output.Content[p.currentContentIndex].(TextContent)
+			if !ok {
+				return
+			}
+
+			var text strings.Builder
+
+			for _, content := range item.Content {
+				if content.Type == "output_text" {
+					text.WriteString(content.Text)
+				} else {
+					text.WriteString(content.Refusal)
+				}
+			}
+
+			block.Text = text.String()
+
+			var phase *TextSignaturePhase
+			if item.Phase != "" {
+				p := TextSignaturePhase(item.Phase)
+				phase = &p
+			}
+
+			signature := EncodeTextSignatureV1(item.ID, phase)
+			block.TextSignature = &signature
+
+			p.output.Content[p.currentContentIndex] = block
+
+			p.stream.Push(TextEndEvent{
+				Type:         "text_end",
+				ContentIndex: int64(p.currentContentIndex),
+				Content:      block.Text,
+				Partial:      *p.output,
+			})
+
+			p.currentContentIndex = -1
+			p.currentItemType = ""
+			p.currentParts = nil
+		case "function_call":
+			var toolCall ToolCall
+
+			if p.currentContentIndex >= 0 {
+				if block, ok := p.output.Content[p.currentContentIndex].(ToolCall); ok {
+					argsJSON := item.Arguments.OfString
+					if block.PartialJson != nil && *block.PartialJson != "" {
+						argsJSON = *block.PartialJson
+					}
+
+					args := map[string]any{}
+					if argsJSON == "" {
+						argsJSON = "{}"
+					}
+					_ = json.Unmarshal([]byte(argsJSON), &args)
+
+					block.Args = args
+					block.PartialJson = nil // strip scratch buffer
+
+					p.output.Content[p.currentContentIndex] = block
+					toolCall = block
+				}
+			}
+
+			if toolCall.Type == "" {
+				argsJSON := item.Arguments.OfString
+				if argsJSON == "" {
+					argsJSON = "{}"
+				}
+
+				args := map[string]any{}
+				_ = json.Unmarshal([]byte(argsJSON), &args)
+
+				toolCall = ToolCall{
+					Type: ContentTypeToolCall,
+					Id:   fmt.Sprintf("%s|%s", item.CallID, item.ID),
+					Name: item.Name,
+					Args: args,
+				}
+
+				p.output.Content = append(p.output.Content, toolCall)
+				p.currentContentIndex = len(p.output.Content) - 1
+			}
+
+			p.stream.Push(ToolCallEndEvent{
+				Type:         "toolcall_end",
+				ContentIndex: int64(p.currentContentIndex),
+				ToolCall:     toolCall,
+				Partial:      *p.output,
+			})
+
+			p.currentContentIndex = -1
+			p.currentItemType = ""
+			p.currentParts = nil
+		}
+	case "response.completed":
+		response := event.Response
+
+		if response.ID != "" {
+			p.output.ResponseID = &response.ID
+		}
+
+		cachedTokens := response.Usage.InputTokensDetails.CachedTokens
+
+		p.output.Usage = Usage{
+			// OpenAI includes cached tokens in input_tokens, so subtract to get non-cached input.
+			Input:      response.Usage.InputTokens - cachedTokens,
+			Output:     response.Usage.OutputTokens,
+			CacheRead:  cachedTokens,
+			CacheWrite: 0,
+			Total:      response.Usage.TotalTokens,
+			Cost: Cost{
+				Input:      decimal.Zero,
+				Output:     decimal.Zero,
+				CacheRead:  decimal.Zero,
+				CacheWrite: decimal.Zero,
+				Total:      decimal.Zero,
+			},
+		}
+
+		CalculateCost(model, p.output.Usage)
+
+		var err error
+		p.output.StopReason, err = MapOpenAIResponseStopReason(response.Status)
+		if err != nil {
+			p.output.StopReason = StopReasonError
+		}
+
+		for _, content := range p.output.Content {
+			if _, ok := content.(ToolCall); ok && p.output.StopReason == StopReasonStop {
+				p.output.StopReason = StopReasonToolUse
+				break
+			}
+		}
+
+		p.stream.Push(DoneEvent{
+			Type:    "done",
+			Message: *p.output,
+		})
+	case "error":
+		message := fmt.Sprintf("Error Code %s: %s", event.Code, event.Message)
+		if message == "Error Code : " {
+			message = "Unknown error"
+		}
+
+		p.output.StopReason = StopReasonError
+		p.output.ErrorMessage = message
+
+		p.stream.Push(ErrorEvent{
+			Type:    "error",
+			Message: *p.output,
+		})
+	case "response.failed":
+		response := event.Response
+
+		msg := "Unknown error (no error details in response)"
+
+		if response.Error.Code != "" || response.Error.Message != "" {
+			code := string(response.Error.Code)
+			if code == "" {
+				code = "unknown"
+			}
+
+			message := response.Error.Message
+			if message == "" {
+				message = "no message"
+			}
+
+			msg = fmt.Sprintf("%s: %s", code, message)
+		} else if response.IncompleteDetails.Reason != "" {
+			msg = fmt.Sprintf("incomplete: %s", response.IncompleteDetails.Reason)
+		}
+
+		p.output.StopReason = StopReasonError
+		p.output.ErrorMessage = msg
+
+		p.stream.Push(ErrorEvent{
+			Type:    "error",
+			Reason:  StopReasonError,
+			Message: *p.output,
+		})
+	}
 }

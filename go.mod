@@ -4,6 +4,7 @@ go 1.26.3
 
 require (
 	github.com/govalues/decimal v0.1.36
+	github.com/joho/godotenv v1.5.1
 	github.com/openai/openai-go/v3 v3.35.0
 )
 

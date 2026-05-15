@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -86,6 +87,59 @@ type responsesStreamProcessor struct {
 	currentParts []responses.ResponseStreamEventUnionPart
 }
 
+func StreamSimpleOpenAIResponses(model Model[API], modelContext ModelContext, options *SimpleStreamOptions) (*AssistantMessageEventStream, error) {
+	apiKey := ""
+	if options != nil && options.ApiKey != nil {
+		apiKey = *options.ApiKey
+	} else {
+		apiKey = getEnvAPIKey(model.Provider)
+	}
+	if apiKey == "" {
+		return nil, fmt.Errorf("No API key for provider: %s", model.Provider)
+	}
+
+	base := buildBaseOpenAIResponseOptions(options, apiKey)
+
+	if options != nil && options.Reasoning != nil {
+		clampedReasoning := ClampThinkingLevel(model, *options.Reasoning)
+		if clampedReasoning != ThinkingLevelOff {
+			reasoningEffort := string(clampedReasoning)
+			base.ReasoningEffort = &reasoningEffort
+		}
+	}
+
+	ctx := context.Background()
+	if options != nil && options.Signal != nil {
+		ctx = *options.Signal
+	}
+
+	return StreamOpenAIResponse(ctx, model, modelContext, base)
+}
+
+func getEnvAPIKey(provider Provider) string {
+	switch provider {
+	case ProviderOpenAI:
+		return os.Getenv("OPENAI_API_KEY")
+	default:
+		return ""
+	}
+}
+
+func buildBaseOpenAIResponseOptions(options *SimpleStreamOptions, apiKey string) *OpenAIResponseOptions {
+	base := &OpenAIResponseOptions{}
+	if options != nil {
+		base.StreamOptions = options.StreamOptions
+	}
+
+	base.ApiKey = &apiKey
+	if base.Cache == nil {
+		cache := CacheRetentionShort
+		base.Cache = &cache
+	}
+
+	return base
+}
+
 func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext ModelContext, options *OpenAIResponseOptions) (*AssistantMessageEventStream, error) {
 	stream := NewAssistantMessageEventStream(16)
 
@@ -113,12 +167,19 @@ func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext Mo
 		Timestamp:  time.Now().UnixMilli(),
 	}
 
+	if options == nil {
+		return nil, fmt.Errorf("options are required")
+	}
 	apiKey := options.ApiKey
 	if apiKey == nil {
 		return nil, fmt.Errorf("apiKey is required")
 	}
+	cache := CacheRetentionShort
+	if options.Cache != nil {
+		cache = *options.Cache
+	}
 	var cacheSessionId *string
-	cacheRetention := ResolveCacheRetention(*options.Cache)
+	cacheRetention := ResolveCacheRetention(cache)
 	if cacheRetention == CacheRetentionNone {
 		cacheSessionId = nil
 	} else {
@@ -148,30 +209,50 @@ func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext Mo
 		for openaiStream.Next() {
 			event := openaiStream.Current()
 			processor.ProcessResponsesStream(event, model, options)
+			if isOpenAIResponsesTerminalEvent(event) {
+				sentTerminalEvent = true
+			}
 		}
 
 		if err := openaiStream.Err(); err != nil {
-			output.StopReason = StopReasonError
-			output.ErrorMessage = err.Error()
-
-			stream.Push(ErrorEvent{
-				Type:    "error",
-				Message: output,
-			})
+			pushOpenAIResponsesStreamError(ctx, stream, &output, err)
+			return
 		}
 
 		if !sentTerminalEvent {
-			output.StopReason = StopReasonError
-			output.ErrorMessage = "OpenAI stream ended without terminal event"
-
-			stream.Push(ErrorEvent{
-				Type:    "error",
-				Message: output,
-			})
+			pushAssistantStreamError(stream, &output, StopReasonError, "OpenAI stream ended without terminal event")
 		}
 	}()
 
 	return stream, nil
+}
+
+func isOpenAIResponsesTerminalEvent(event responses.ResponseStreamEventUnion) bool {
+	switch event.Type {
+	case "response.completed", "response.failed", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+func pushOpenAIResponsesStreamError(ctx context.Context, stream *AssistantMessageEventStream, output *AssistantMessage, err error) {
+	reason := StopReasonError
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		reason = StopReasonAborted
+	}
+	pushAssistantStreamError(stream, output, reason, err.Error())
+}
+
+func pushAssistantStreamError(stream *AssistantMessageEventStream, output *AssistantMessage, reason StopReason, message string) {
+	output.StopReason = reason
+	output.ErrorMessage = message
+
+	stream.Push(ErrorEvent{
+		Type:    "error",
+		Reason:  reason,
+		Message: *output,
+	})
 }
 
 func CreateOpenAIResponsesClient(
@@ -1039,13 +1120,7 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 			message = "Unknown error"
 		}
 
-		p.output.StopReason = StopReasonError
-		p.output.ErrorMessage = message
-
-		p.stream.Push(ErrorEvent{
-			Type:    "error",
-			Message: *p.output,
-		})
+		pushAssistantStreamError(p.stream, p.output, StopReasonError, message)
 	case "response.failed":
 		response := event.Response
 

@@ -25,7 +25,7 @@ func Complete(model Model[API], modelContext ModelContext, options *StreamOption
 		return AssistantMessage{}, err
 	}
 
-	return s.stream.result.message, nil
+	return s.Result()
 }
 
 func StreamSimple(model Model[API], modelContext ModelContext, options *SimpleStreamOptions) (*AssistantMessageEventStream, error) {
@@ -43,5 +43,5 @@ func CompleteSimple(model Model[API], modelContext ModelContext, options *Simple
 		return AssistantMessage{}, err
 	}
 
-	return s.stream.result.message, nil
+	return s.Result()
 }

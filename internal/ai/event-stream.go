@@ -140,9 +140,5 @@ func (s *AssistantMessageEventStream) Events() <-chan AssistantMessageEvent {
 
 func (s *AssistantMessageEventStream) Result() (AssistantMessage, error) {
 	result := s.stream.Result()
-	if result.err != nil {
-		return AssistantMessage{}, result.err
-	}
-
-	return result.message, nil
+	return result.message, result.err
 }

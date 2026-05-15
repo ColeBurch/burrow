@@ -172,6 +172,13 @@ func TestResponsesStreamProcessorTextEvents(t *testing.T) {
 	}
 }
 
+func TestStreamOpenAIResponseNilOptionsReturnsSetupError(t *testing.T) {
+	_, err := StreamOpenAIResponse(context.Background(), testResponsesModel(), ModelContext{}, nil)
+	if err == nil || err.Error() != "options are required" {
+		t.Fatalf("err = %v, want options are required", err)
+	}
+}
+
 func TestResponsesStreamProcessorCreatedEventSetsResponseID(t *testing.T) {
 	model := testResponsesModel()
 	processor, stream := newTestResponsesStreamProcessor(model)
@@ -332,9 +339,9 @@ func TestResponsesStreamProcessorCompletedEvent(t *testing.T) {
 			ID:     "resp_done",
 			Status: responses.ResponseStatusCompleted,
 			Usage: responses.ResponseUsage{
-				InputTokens:  10,
-				OutputTokens: 4,
-				TotalTokens:  14,
+				InputTokens:        10,
+				OutputTokens:       4,
+				TotalTokens:        14,
 				InputTokensDetails: responses.ResponseUsageInputTokensDetails{CachedTokens: 3},
 			},
 		},
@@ -408,9 +415,12 @@ func TestResponsesStreamProcessorErrorEvents(t *testing.T) {
 			processor, stream := newTestResponsesStreamProcessor(model)
 			processor.ProcessResponsesStream(tt.event, model, nil)
 			assertEventTypes(t, stream, "error")
-			_, err := stream.Result()
+			msg, err := stream.Result()
 			if err == nil || err.Error() != tt.want {
 				t.Fatalf("err = %v, want %q", err, tt.want)
+			}
+			if msg.StopReason != StopReasonError || msg.ErrorMessage != tt.want {
+				t.Fatalf("Result message = %+v, want error final message", msg)
 			}
 			if processor.output.StopReason != StopReasonError || processor.output.ErrorMessage != tt.want {
 				t.Fatalf("output = %+v", processor.output)

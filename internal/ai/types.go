@@ -361,13 +361,13 @@ type Model[tApi API] struct {
 	Name             string                 `json:"name"`
 	API              tApi                   `json:"api"`
 	Provider         Provider               `json:"provider"`
-	BaseURL          string                 `json:"base_url"`
+	BaseURL          string                 `json:"baseUrl"`
 	Reasoning        bool                   `json:"reasoning"`
-	ThinkingLevelMap ThinkingLevelMap       `json:"thinking_level_map"`
+	ThinkingLevelMap ThinkingLevelMap       `json:"thinkingLevelMap"`
 	Input            []string               `json:"input"`
 	Cost             Cost                   `json:"cost"` // $/million tokens
-	ContextWindow    int                    `json:"context_window"`
-	MaxTokens        int                    `json:"max_tokens"`
+	ContextWindow    int                    `json:"contextWindow"`
+	MaxTokens        int                    `json:"maxTokens"`
 	Headers          *map[string]string     `json:"headers"`
 	Compat           *OpenAIResponsesCompat `json:"compat"`
 }

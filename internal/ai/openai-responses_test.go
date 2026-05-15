@@ -454,6 +454,112 @@ func TestResponsesStreamProcessorIgnoresInvalidStateEvents(t *testing.T) {
 	}
 }
 
+func TestStreamOpenAIResponseToolCallLive(t *testing.T) {
+	err := godotenv.Load("../../.env")
+	if err != nil {
+		fmt.Println("Error loading .env file", err)
+	}
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		t.Skip("OPENAI_API_KEY not set")
+	}
+
+	maxTokens := int64(1000)
+	cache := CacheRetentionNone
+	xhigh := "xhigh"
+
+	model := Model[API]{
+		ID:               "gpt-5.4-nano",
+		API:              APIOpenAIResponses,
+		Provider:         ProviderOpenAI,
+		BaseURL:          "https://api.openai.com/v1",
+		Reasoning:        true,
+		ThinkingLevelMap: ThinkingLevelMap{ThinkingLevelOff: nil, ThinkingLevelXHigh: &xhigh},
+		Input:            []string{"text", "image"},
+		Cost: Cost{
+			Input:      decimal.MustParse("0.2"),
+			Output:     decimal.MustParse("1.25"),
+			CacheRead:  decimal.MustParse("0.02"),
+			CacheWrite: decimal.Zero,
+		},
+		ContextWindow: 400000,
+		MaxTokens:     128000,
+	}
+
+	modelContext := ModelContext{
+		Messages: []Message{
+			UserMessage{
+				Role: RoleUser,
+				Content: []UserContent{
+					TextContent{Type: ContentTypeText, Text: "Use the getweather tool to get the weather in Cupertino, California. Do not answer from memory; call the tool."},
+				},
+			},
+		},
+		Tools: []*Tool{
+			{
+				Name:        "getweather",
+				Description: "Get the current weather for a location.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"city": map[string]any{
+							"type":        "string",
+							"description": "The city to get weather for.",
+						},
+						"state": map[string]any{
+							"type":        "string",
+							"description": "The US state to get weather for.",
+						},
+					},
+					"required":             []string{"city", "state"},
+					"additionalProperties": false,
+				},
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	stream, err := StreamOpenAIResponse(ctx, model, modelContext, &OpenAIResponseOptions{
+		StreamOptions: StreamOptions{
+			ApiKey:    &apiKey,
+			Cache:     &cache,
+			MaxTokens: &maxTokens,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for event := range stream.Events() {
+		t.Logf("event: %T %s", event, event.EventType())
+	}
+
+	msg, err := stream.Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.StopReason != StopReasonToolUse {
+		t.Fatalf("StopReason = %q, want %q; message: %+v", msg.StopReason, StopReasonToolUse, msg)
+	}
+
+	var weatherToolCall *ToolCall
+	for _, content := range msg.Content {
+		if toolCall, ok := content.(ToolCall); ok && toolCall.Name == "getweather" {
+			weatherToolCall = &toolCall
+			break
+		}
+	}
+	if weatherToolCall == nil {
+		t.Fatalf("expected getweather tool call in final message: %+v", msg)
+	}
+	if weatherToolCall.Args["city"] != "Cupertino" || weatherToolCall.Args["state"] != "California" {
+		t.Fatalf("unexpected getweather args: %+v", weatherToolCall.Args)
+	}
+	t.Logf("final message: %+v", msg)
+}
+
 func TestStreamOpenAIResponseLive(t *testing.T) {
 	err := godotenv.Load("../../.env")
 	if err != nil {

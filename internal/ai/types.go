@@ -43,12 +43,12 @@ type ImageContent struct {
 }
 
 type ToolCall struct {
-	Type             ContentType    `json:"type"`
-	Id               string         `json:"id"`
-	Name             string         `json:"name"`
-	Args             map[string]any `json:"args"`
-	ThoughtSignature *string        `json:"thoughtSignature,omitempty"`
-	PartialJson      *string        `json:"partialJson,omitempty"`
+	Type             ContentType `json:"type"`
+	Id               string      `json:"id"`
+	Name             string      `json:"name"`
+	Args             any         `json:"args"`
+	ThoughtSignature *string     `json:"thoughtSignature,omitempty"`
+	PartialJson      *string     `json:"partialJson,omitempty"`
 }
 
 type UserContent interface {
@@ -344,7 +344,7 @@ type ProviderResponse struct {
 type StreamOptions struct {
 	Temperature       *decimal.Decimal                                        `json:"temperature,omitempty"`
 	MaxTokens         *int64                                                  `json:"max_tokens,omitempty"`
-	Signal            *context.Context                                        `json:"signal,omitempty"`
+	Signal            context.Context                                         `json:"signal,omitempty"`
 	ApiKey            *string                                                 `json:"api_key,omitempty"`
 	Transport         *Transport                                              `json:"transport,omitempty"`
 	Cache             *CacheRetention                                         `json:"cache,omitempty"`

@@ -67,6 +67,15 @@ func assertEventTypes(t *testing.T, stream *AssistantMessageEventStream, wantTyp
 	}
 }
 
+func requireToolArgsMap(t *testing.T, args any) map[string]any {
+	t.Helper()
+	argsMap, ok := args.(map[string]any)
+	if !ok {
+		t.Fatalf("tool args = %T, want map[string]any", args)
+	}
+	return argsMap
+}
+
 func TestResponsesStreamProcessorTextEvents(t *testing.T) {
 	model := Model[API]{
 		ID:       "gpt-4.1-mini",
@@ -293,7 +302,8 @@ func TestResponsesStreamProcessorToolCallEvents(t *testing.T) {
 	if !ok {
 		t.Fatalf("Content[0] = %T, want ToolCall", processor.output.Content[0])
 	}
-	if tool.Id != "call_1|fc_1" || tool.Name != "lookup" || tool.PartialJson != nil || tool.Args["city"] != "Paris" {
+	args := requireToolArgsMap(t, tool.Args)
+	if tool.Id != "call_1|fc_1" || tool.Name != "lookup" || tool.PartialJson != nil || args["city"] != "Paris" {
 		t.Fatalf("tool call = %+v", tool)
 	}
 }
@@ -309,7 +319,8 @@ func TestResponsesStreamProcessorToolCallDoneFallbackAndNoDuplicateDelta(t *test
 
 	assertEventTypes(t, stream, "toolcall_end")
 	tool := processor.output.Content[0].(ToolCall)
-	if tool.Id != "call_2|fc_2" || tool.Args["n"] != float64(2) {
+	args := requireToolArgsMap(t, tool.Args)
+	if tool.Id != "call_2|fc_2" || args["n"] != float64(2) {
 		t.Fatalf("tool call = %+v", tool)
 	}
 
@@ -564,7 +575,8 @@ func TestStreamOpenAIResponseToolCallLive(t *testing.T) {
 	if weatherToolCall == nil {
 		t.Fatalf("expected getweather tool call in final message: %+v", msg)
 	}
-	if weatherToolCall.Args["city"] != "Cupertino" || weatherToolCall.Args["state"] != "California" {
+	args := requireToolArgsMap(t, weatherToolCall.Args)
+	if args["city"] != "Cupertino" || args["state"] != "California" {
 		t.Fatalf("unexpected getweather args: %+v", weatherToolCall.Args)
 	}
 	t.Logf("final message: %+v", msg)

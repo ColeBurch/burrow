@@ -110,7 +110,7 @@ func StreamSimpleOpenAIResponses(model Model[API], modelContext ModelContext, op
 
 	ctx := context.Background()
 	if options != nil && options.Signal != nil {
-		ctx = *options.Signal
+		ctx = options.Signal
 	}
 
 	return StreamOpenAIResponse(ctx, model, modelContext, base)

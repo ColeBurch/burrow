@@ -17,6 +17,20 @@ type ConvertToLLMFunc func(messages []AgentMessage) []ai.Message
 
 type TransformContextFunc func(ctx context.Context, messages []AgentMessage) []AgentMessage
 
+// StreamFn starts an assistant message stream.
+//
+// It may return an error when no stream could be created, such as invalid
+// configuration, an unsupported model/provider, missing credentials, or request
+// construction failure. If a non-nil stream is returned, callers should consume
+// it; runtime/provider/transport failures after stream creation are reported by
+// the stream events and Result method.
+type StreamFn func(
+	ctx context.Context,
+	model ai.Model[ai.API],
+	modelContext ai.ModelContext,
+	options *ai.SimpleStreamOptions,
+) (*ai.AssistantMessageEventStream, error)
+
 // Result returned from `beforeToolCall`.
 //
 // Returning `{ block: true }` prevents the tool from executing. The loop emits an error tool result instead.
@@ -67,7 +81,7 @@ type BeforeToolCallContext struct {
 	/** The raw tool call block from `assistantMessage.content`. */
 	ToolCall ai.ToolCall
 	/** Validated tool arguments for the target tool schema. */
-	args map[string]any
+	args any
 	/** Current agent context at the time the tool call is prepared. */
 	Context AgentContext
 }
@@ -78,7 +92,7 @@ type AfterToolCallContext[TDetails any] struct {
 	/** The raw tool call block from `assistantMessage.content`. */
 	ToolCall ai.ToolCall
 	/** Validated tool arguments for the target tool schema. */
-	args map[string]any
+	args any
 	/** The executed tool result before any `afterToolCall` overrides are applied. */
 	Result AgentToolResult[TDetails]
 	/** Whether the executed tool result is currently treated as an error. */
@@ -125,6 +139,7 @@ type AgentEvent interface {
 type AgentLoopConfig struct {
 	ai.SimpleStreamOptions
 	Model               ai.Model[ai.API]
+	Stream              StreamFn             `json:"-"`
 	ConvertToLLM        ConvertToLLMFunc     `json:"convert_to_llm"`
 	TransformContext    TransformContextFunc `json:"transform_context"`
 	GetAPIKey           func(provider string) *string
@@ -132,8 +147,8 @@ type AgentLoopConfig struct {
 	GetSteeringMessages func(ctx context.Context) []AgentMessage
 	GetFollowUpMessages func(ctx context.Context) []AgentMessage
 	ToolExecution       *ToolExecutionMode
-	BeforeToolCall      func(ctx context.Context, call BeforeToolCallContext) *BeforeToolCallResult
-	AfterToolCall       func(ctx context.Context, call AfterToolCallContext[any]) *AfterToolCallResult
+	BeforeToolCall      func(ctx context.Context, call BeforeToolCallContext) (*BeforeToolCallResult, error)
+	AfterToolCall       func(ctx context.Context, call AfterToolCallContext[any]) (*AfterToolCallResult, error)
 }
 
 type StartEvent struct {
@@ -186,20 +201,20 @@ type MessageEndEvent struct {
 func (MessageEndEvent) EventType() string { return "message_end" }
 
 type ToolExecutionStartEvent struct {
-	Type       string         `json:"type"`
-	ToolCallID string         `json:"tool_call_id"`
-	ToolName   string         `json:"tool_name"`
-	ToolArgs   map[string]any `json:"tool_args"`
+	Type       string `json:"type"`
+	ToolCallID string `json:"tool_call_id"`
+	ToolName   string `json:"tool_name"`
+	ToolArgs   any    `json:"tool_args"`
 }
 
 func (ToolExecutionStartEvent) EventType() string { return "tool_execution_start" }
 
 type ToolExecutionUpdateEvent struct {
-	Type          string         `json:"type"`
-	ToolCallID    string         `json:"tool_call_id"`
-	ToolName      string         `json:"tool_name"`
-	ToolArgs      map[string]any `json:"tool_args"`
-	PartialResult any            `json:"partial_result"`
+	Type          string `json:"type"`
+	ToolCallID    string `json:"tool_call_id"`
+	ToolName      string `json:"tool_name"`
+	ToolArgs      any    `json:"tool_args"`
+	PartialResult any    `json:"partial_result"`
 }
 
 func (ToolExecutionUpdateEvent) EventType() string { return "tool_execution_update" }

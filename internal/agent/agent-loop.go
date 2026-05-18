@@ -15,6 +15,38 @@ const agentStreamBuffer = 64
 
 type AgentEventSink func(event AgentEvent) error
 
+func AgentLoop(
+	prompts []AgentMessage,
+	context AgentContext,
+	config AgentLoopConfig,
+	signal context.Context,
+	streamFn *StreamFn,
+) (*ai.EventStream[AgentEvent, []AgentMessage], error) {
+	stream := CreateAgentStream()
+	go func() {
+		messages, err := RunAgentLoop(
+			prompts,
+			context,
+			config,
+			signal,
+			func(event AgentEvent) error {
+				stream.Push(event)
+				return nil
+			},
+			streamFn,
+		)
+		if err != nil {
+			stream.Push(EndEvent{
+				Type:     "agent_end",
+				Messages: messages,
+			})
+			return
+		}
+		stream.End(messages)
+	}()
+	return stream, nil
+}
+
 func AgentLoopContinue(
 	context AgentContext,
 	config AgentLoopConfig,
@@ -47,7 +79,6 @@ func AgentLoopContinue(
 				Type:     "agent_end",
 				Messages: messages,
 			})
-			stream.End(messages)
 			return
 		}
 		stream.End(messages)
@@ -72,24 +103,24 @@ func RunAgentLoop(
 		Tools:        context.Tools,
 	}
 
-	emit(StartEvent{
-		Type: "agent_start",
-	})
-	emit(TurnStartEvent{
-		Type: "turn_start",
-	})
+	if err := emit(StartEvent{Type: "agent_start"}); err != nil {
+		return newMessages, err
+	}
+	if err := emit(TurnStartEvent{Type: "turn_start"}); err != nil {
+		return newMessages, err
+	}
 	for _, prompt := range prompts {
-		emit(MessageStartEvent{
-			Type:    "message_start",
-			Message: prompt,
-		})
-		emit(MessageEndEvent{
-			Type:    "message_end",
-			Message: prompt,
-		})
+		if err := emit(MessageStartEvent{Type: "message_start", Message: prompt}); err != nil {
+			return newMessages, err
+		}
+		if err := emit(MessageEndEvent{Type: "message_end", Message: prompt}); err != nil {
+			return newMessages, err
+		}
 	}
 
-	RunLoop(currentContext, &newMessages, config, signal, emit, streamFn)
+	if err := RunLoop(currentContext, &newMessages, config, signal, emit, streamFn); err != nil {
+		return newMessages, err
+	}
 
 	return newMessages, nil
 }
@@ -116,14 +147,16 @@ func RunAgentLoopContinue(
 		Tools:        context.Tools,
 	}
 
-	emit(StartEvent{
-		Type: "agent_start",
-	})
-	emit(TurnStartEvent{
-		Type: "turn_start",
-	})
+	if err := emit(StartEvent{Type: "agent_start"}); err != nil {
+		return newMessages, err
+	}
+	if err := emit(TurnStartEvent{Type: "turn_start"}); err != nil {
+		return newMessages, err
+	}
 
-	RunLoop(currentContext, &newMessages, config, signal, emit, streamFn)
+	if err := RunLoop(currentContext, &newMessages, config, signal, emit, streamFn); err != nil {
+		return newMessages, err
+	}
 	return newMessages, nil
 }
 
@@ -149,7 +182,7 @@ func RunLoop(
 	signal context.Context,
 	emit AgentEventSink,
 	streamFn *StreamFn,
-) {
+) error {
 	firstTurn := true
 	pendingMessages := config.GetSteeringMessages(signal)
 
@@ -158,56 +191,52 @@ func RunLoop(
 
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
 			if !firstTurn {
-				emit(TurnStartEvent{
-					Type: "turn_start",
-				})
+				if err := emit(TurnStartEvent{Type: "turn_start"}); err != nil {
+					return err
+				}
 			} else {
 				firstTurn = false
 			}
 
 			if len(pendingMessages) > 0 {
 				for _, msg := range pendingMessages {
-					emit(MessageStartEvent{
-						Type:    "message_start",
-						Message: msg,
-					})
-					emit(MessageEndEvent{
-						Type:    "message_end",
-						Message: msg,
-					})
+					if err := emit(MessageStartEvent{Type: "message_start", Message: msg}); err != nil {
+						return err
+					}
+					if err := emit(MessageEndEvent{Type: "message_end", Message: msg}); err != nil {
+						return err
+					}
 					currentContext.Messages = append(currentContext.Messages, msg)
 					*newMessages = append(*newMessages, msg)
 				}
 				pendingMessages = []AgentMessage{}
 			}
 
-			message, err := streamAssistantResponse(&currentContext, config, signal, emit, *streamFn)
+			var selectedStreamFn StreamFn
+			if streamFn != nil {
+				selectedStreamFn = *streamFn
+			}
+			message, err := streamAssistantResponse(&currentContext, config, signal, emit, selectedStreamFn)
 			if err != nil {
 				*newMessages = append(*newMessages, message)
-				emit(TurnEndEvent{
-					Type:        "turn_end",
-					Message:     message,
-					ToolResults: []ai.ToolResultMessage{},
-				})
-				emit(EndEvent{
-					Type:     "agent_end",
-					Messages: *newMessages,
-				})
-				return
+				if emitErr := emit(TurnEndEvent{Type: "turn_end", Message: message, ToolResults: []ai.ToolResultMessage{}}); emitErr != nil {
+					return emitErr
+				}
+				if emitErr := emit(EndEvent{Type: "agent_end", Messages: *newMessages}); emitErr != nil {
+					return emitErr
+				}
+				return err
 			}
 			*newMessages = append(*newMessages, message)
 
 			if message.StopReason == "error" || message.StopReason == "aborted" {
-				emit(TurnEndEvent{
-					Type:        "turn_end",
-					Message:     message,
-					ToolResults: []ai.ToolResultMessage{},
-				})
-				emit(EndEvent{
-					Type:     "agent_end",
-					Messages: *newMessages,
-				})
-				return
+				if err := emit(TurnEndEvent{Type: "turn_end", Message: message, ToolResults: []ai.ToolResultMessage{}}); err != nil {
+					return err
+				}
+				if err := emit(EndEvent{Type: "agent_end", Messages: *newMessages}); err != nil {
+					return err
+				}
+				return nil
 			}
 
 			var toolCalls []ai.ToolCall
@@ -221,7 +250,10 @@ func RunLoop(
 			toolResults := []ai.ToolResultMessage{}
 			hasMoreToolCalls = false
 			if len(toolCalls) > 0 {
-				executedToolBatch := ExecuteToolCalls(currentContext, message, config, signal, emit)
+				executedToolBatch, err := ExecuteToolCalls(currentContext, message, config, signal, emit)
+				if err != nil {
+					return err
+				}
 				for _, result := range executedToolBatch.message {
 					toolResults = append(toolResults, result)
 				}
@@ -233,11 +265,13 @@ func RunLoop(
 				}
 			}
 
-			emit(TurnEndEvent{
+			if err := emit(TurnEndEvent{
 				Type:        "turn_end",
 				Message:     message,
 				ToolResults: toolResults,
-			})
+			}); err != nil {
+				return err
+			}
 
 			if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(ShouldStopAfterTurnContext{
 				Message:     message,
@@ -245,11 +279,13 @@ func RunLoop(
 				Context:     currentContext,
 				NewMessages: *newMessages,
 			}) {
-				emit(EndEvent{
+				if err := emit(EndEvent{
 					Type:     "agent_end",
 					Messages: *newMessages,
-				})
-				return
+				}); err != nil {
+					return err
+				}
+				return nil
 			}
 
 			pendingMessages = config.GetSteeringMessages(signal)
@@ -264,10 +300,13 @@ func RunLoop(
 		break
 	}
 
-	emit(EndEvent{
+	if err := emit(EndEvent{
 		Type:     "agent_end",
 		Messages: *newMessages,
-	})
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func streamAssistantResponse(
@@ -475,7 +514,7 @@ func ExecuteToolCalls(
 	config AgentLoopConfig,
 	signal context.Context,
 	emit AgentEventSink,
-) ExecutedToolCallBatch {
+) (ExecutedToolCallBatch, error) {
 	var toolCalls []ai.ToolCall
 	for _, content := range assistantMessage.Content {
 		if toolCall, ok := content.(ai.ToolCall); ok {
@@ -506,21 +545,23 @@ func ExecuteToolCallsParallel(
 	config AgentLoopConfig,
 	signal context.Context,
 	emit AgentEventSink,
-) ExecutedToolCallBatch {
+) (ExecutedToolCallBatch, error) {
 	type finalizedEntry struct {
 		finalized *FinalizedToolCallOutcome
-		run       func() FinalizedToolCallOutcome
+		run       func() (FinalizedToolCallOutcome, error)
 	}
 
 	finalizedCalls := make([]finalizedEntry, 0, len(toolCalls))
 
 	for _, toolCall := range toolCalls {
-		emit(ToolExecutionStartEvent{
+		if err := emit(ToolExecutionStartEvent{
 			Type:       "tool_execution_start",
 			ToolCallID: toolCall.Id,
 			ToolName:   toolCall.Name,
 			ToolArgs:   toolCall.Args,
-		})
+		}); err != nil {
+			return ExecutedToolCallBatch{}, err
+		}
 
 		preparation := PrepareToolCall(currentContext, assistantMessage, toolCall, config, signal)
 		switch preparation := preparation.(type) {
@@ -530,13 +571,15 @@ func ExecuteToolCallsParallel(
 				result:   preparation.result,
 				isError:  preparation.isError,
 			}
-			EmitToolExecutionEnd(finalized, emit)
+			if err := EmitToolExecutionEnd(finalized, emit); err != nil {
+				return ExecutedToolCallBatch{}, err
+			}
 			finalizedCalls = append(finalizedCalls, finalizedEntry{finalized: &finalized})
 
 		case PreparedToolCall:
 			prepared := preparation
 			finalizedCalls = append(finalizedCalls, finalizedEntry{
-				run: func() FinalizedToolCallOutcome {
+				run: func() (FinalizedToolCallOutcome, error) {
 					executed, err := ExecutePreparedToolCall(prepared, signal, emit)
 					if err != nil {
 						finalized := FinalizedToolCallOutcome{
@@ -544,8 +587,7 @@ func ExecuteToolCallsParallel(
 							result:   CreateErrorToolResult(err.Error()),
 							isError:  true,
 						}
-						EmitToolExecutionEnd(finalized, emit)
-						return finalized
+						return finalized, EmitToolExecutionEnd(finalized, emit)
 					}
 
 					finalized := FinalizeExecutedToolCall(
@@ -556,14 +598,14 @@ func ExecuteToolCallsParallel(
 						&config,
 						signal,
 					)
-					EmitToolExecutionEnd(finalized, emit)
-					return finalized
+					return finalized, EmitToolExecutionEnd(finalized, emit)
 				},
 			})
 		}
 	}
 
 	orderedFinalizedCalls := make([]FinalizedToolCallOutcome, len(finalizedCalls))
+	errs := make([]error, len(finalizedCalls))
 	var wg sync.WaitGroup
 	for i, entry := range finalizedCalls {
 		if entry.finalized != nil {
@@ -572,24 +614,29 @@ func ExecuteToolCallsParallel(
 		}
 
 		wg.Add(1)
-		go func(i int, run func() FinalizedToolCallOutcome) {
+		go func(i int, run func() (FinalizedToolCallOutcome, error)) {
 			defer wg.Done()
-			orderedFinalizedCalls[i] = run()
+			orderedFinalizedCalls[i], errs[i] = run()
 		}(i, entry.run)
 	}
 	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return ExecutedToolCallBatch{}, err
+	}
 
 	messages := make([]ai.ToolResultMessage, 0, len(orderedFinalizedCalls))
 	for _, finalized := range orderedFinalizedCalls {
 		toolResultMessage := CreateToolResultMessage(finalized)
-		EmitToolResultMessage(*toolResultMessage, emit)
+		if err := EmitToolResultMessage(*toolResultMessage, emit); err != nil {
+			return ExecutedToolCallBatch{}, err
+		}
 		messages = append(messages, *toolResultMessage)
 	}
 
 	return ExecutedToolCallBatch{
 		message:   messages,
 		terminate: ShouldTerminateToolBatch(orderedFinalizedCalls),
-	}
+	}, nil
 }
 
 func ExecuteToolCallsSequential(
@@ -599,17 +646,19 @@ func ExecuteToolCallsSequential(
 	config AgentLoopConfig,
 	signal context.Context,
 	emit AgentEventSink,
-) ExecutedToolCallBatch {
+) (ExecutedToolCallBatch, error) {
 	var finalizedCalls []FinalizedToolCallOutcome
 	var messages []ai.ToolResultMessage
 
 	for _, toolCall := range toolCalls {
-		emit(ToolExecutionStartEvent{
+		if err := emit(ToolExecutionStartEvent{
 			Type:       "tool_execution_start",
 			ToolCallID: toolCall.Id,
 			ToolName:   toolCall.Name,
 			ToolArgs:   toolCall.Args,
-		})
+		}); err != nil {
+			return ExecutedToolCallBatch{}, err
+		}
 
 		preparation := PrepareToolCall(currentContext, assistantMessage, toolCall, config, signal)
 		var finalized FinalizedToolCallOutcome
@@ -639,9 +688,13 @@ func ExecuteToolCallsSequential(
 				signal,
 			)
 		}
-		EmitToolExecutionEnd(finalized, emit)
+		if err := EmitToolExecutionEnd(finalized, emit); err != nil {
+			return ExecutedToolCallBatch{}, err
+		}
 		toolResultMessage := CreateToolResultMessage(finalized)
-		EmitToolResultMessage(*toolResultMessage, emit)
+		if err := EmitToolResultMessage(*toolResultMessage, emit); err != nil {
+			return ExecutedToolCallBatch{}, err
+		}
 		finalizedCalls = append(finalizedCalls, finalized)
 		messages = append(messages, *toolResultMessage)
 	}
@@ -649,7 +702,7 @@ func ExecuteToolCallsSequential(
 	return ExecutedToolCallBatch{
 		message:   messages,
 		terminate: ShouldTerminateToolBatch(finalizedCalls),
-	}
+	}, nil
 }
 
 func ShouldTerminateToolBatch(finalizedCalls []FinalizedToolCallOutcome) bool {
@@ -853,8 +906,8 @@ func FinalizeExecutedToolCall(
 func EmitToolExecutionEnd(
 	finalized FinalizedToolCallOutcome,
 	emit AgentEventSink,
-) {
-	emit(ToolExecutionEndEvent{
+) error {
+	return emit(ToolExecutionEndEvent{
 		Type:       "tool_execution_end",
 		ToolCallID: finalized.toolCall.Id,
 		ToolName:   finalized.toolCall.Name,
@@ -879,12 +932,14 @@ func CreateToolResultMessage(
 func EmitToolResultMessage(
 	toolResultMessage ai.ToolResultMessage,
 	emit AgentEventSink,
-) {
-	emit(MessageStartEvent{
+) error {
+	if err := emit(MessageStartEvent{
 		Type:    "message_start",
 		Message: toolResultMessage,
-	})
-	emit(MessageEndEvent{
+	}); err != nil {
+		return err
+	}
+	return emit(MessageEndEvent{
 		Type:    "message_end",
 		Message: toolResultMessage,
 	})

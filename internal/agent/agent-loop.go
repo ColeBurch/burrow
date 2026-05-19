@@ -780,7 +780,7 @@ func PrepareToolCall(
 				isError: true,
 			}
 		}
-		if result.Block != nil && *result.Block {
+		if result != nil && result.Block != nil && *result.Block {
 			var reason string
 			if result.Reason != nil {
 				reason = *result.Reason

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ColeBurch/burrow/internal/ai"
+	"github.com/ColeBurch/burrow/ai"
 )
 
 type customMessage struct {

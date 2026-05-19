@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/ColeBurch/burrow/internal/ai"
+	"github.com/ColeBurch/burrow/ai"
 )
 
 // DefaultStreamFn adapts the lower-level ai.StreamSimple function to the

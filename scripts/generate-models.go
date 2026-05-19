@@ -25,11 +25,11 @@ type modelsDevProvider struct {
 }
 
 type modelsDevModel struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	ToolCall   bool   `json:"tool_call"`
-	Reasoning  bool   `json:"reasoning"`
-	Limit      *struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	ToolCall  bool   `json:"tool_call"`
+	Reasoning bool   `json:"reasoning"`
+	Limit     *struct {
 		Context *int `json:"context"`
 		Output  *int `json:"output"`
 	} `json:"limit"`
@@ -91,7 +91,7 @@ func main() {
 			reasoning++
 		}
 	}
-	fmt.Printf("Generated internal/ai/models.generated.go\n")
+	fmt.Printf("Generated ai/models.generated.go\n")
 	fmt.Printf("OpenAI models: %d\n", len(models))
 	fmt.Printf("Reasoning-capable models: %d\n", reasoning)
 }
@@ -301,7 +301,7 @@ func writeGenerated(models []model) error {
 	if err != nil {
 		return fmt.Errorf("format generated source: %w\n%s", err, out.String())
 	}
-	return os.WriteFile("internal/ai/models.generated.go", formatted, 0o644)
+	return os.WriteFile("ai/models.generated.go", formatted, 0o644)
 }
 
 func writeModel(out *bytes.Buffer, m model) {

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ColeBurch/burrow/internal/ai"
+	"github.com/ColeBurch/burrow/ai"
 	"github.com/govalues/decimal"
 )
 

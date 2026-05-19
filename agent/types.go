@@ -3,7 +3,7 @@ package agent
 import (
 	"context"
 
-	"github.com/ColeBurch/burrow/internal/ai"
+	"github.com/ColeBurch/burrow/ai"
 )
 
 type ToolExecutionMode string

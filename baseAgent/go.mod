@@ -5,6 +5,7 @@ go 1.26.3
 require (
 	github.com/ColeBurch/burrow/agent v0.1.0
 	github.com/ColeBurch/burrow/ai v0.1.0
+	github.com/google/uuid v1.6.0
 )
 
 require (

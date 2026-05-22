@@ -314,6 +314,7 @@ func (s *SessionManager) NewSession(ctx context.Context, header *SessionHeader, 
 		header = NewDefaultSessionHeader(nil, metadata)
 	}
 
+	s.sessionID = header.ID
 	s.Header = header
 	s.Entries = []SessionEntry{}
 	s.byID = map[string]SessionEntry{}

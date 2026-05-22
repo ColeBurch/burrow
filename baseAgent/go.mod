@@ -3,8 +3,8 @@ module github.com/ColeBurch/burrow/baseAgent
 go 1.26.3
 
 require (
-	github.com/ColeBurch/burrow/agent v0.1.1
-	github.com/ColeBurch/burrow/ai v0.1.1
+	github.com/ColeBurch/burrow/agent v0.1.2
+	github.com/ColeBurch/burrow/ai v0.1.2
 	github.com/google/uuid v1.6.0
 )
 

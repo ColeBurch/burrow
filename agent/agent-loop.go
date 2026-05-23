@@ -9,9 +9,18 @@ import (
 	"time"
 
 	"github.com/ColeBurch/burrow/ai"
+	"github.com/google/uuid"
 )
 
 const agentStreamBuffer = 64
+
+func newMessageID() string {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return uuid.NewString()
+	}
+	return id.String()
+}
 
 type AgentEventSink func(event AgentEvent) error
 
@@ -110,10 +119,11 @@ func RunAgentLoop(
 		return newMessages, err
 	}
 	for _, prompt := range prompts {
-		if err := emit(MessageStartEvent{Type: "message_start", Message: prompt}); err != nil {
+		messageID := newMessageID()
+		if err := emit(MessageStartEvent{Type: "message_start", MessageID: messageID, Message: prompt}); err != nil {
 			return newMessages, err
 		}
-		if err := emit(MessageEndEvent{Type: "message_end", Message: prompt}); err != nil {
+		if err := emit(MessageEndEvent{Type: "message_end", MessageID: messageID, Message: prompt}); err != nil {
 			return newMessages, err
 		}
 	}
@@ -200,10 +210,11 @@ func RunLoop(
 
 			if len(pendingMessages) > 0 {
 				for _, msg := range pendingMessages {
-					if err := emit(MessageStartEvent{Type: "message_start", Message: msg}); err != nil {
+					messageID := newMessageID()
+					if err := emit(MessageStartEvent{Type: "message_start", MessageID: messageID, Message: msg}); err != nil {
 						return err
 					}
-					if err := emit(MessageEndEvent{Type: "message_end", Message: msg}); err != nil {
+					if err := emit(MessageEndEvent{Type: "message_end", MessageID: messageID, Message: msg}); err != nil {
 						return err
 					}
 					currentContext.Messages = append(currentContext.Messages, msg)
@@ -352,14 +363,15 @@ func streamAssistantResponse(
 
 	options.Signal = signal
 
+	messageID := newMessageID()
 	response, err := streamFn(signal, config.Model, llmContext, &options)
 	if err != nil {
 		message := AssistantErrorMessage(signal, config.Model, err)
 		agentContext.Messages = append(agentContext.Messages, message)
-		if err := emit(MessageStartEvent{Type: "message_start", Message: message}); err != nil {
+		if err := emit(MessageStartEvent{Type: "message_start", MessageID: messageID, Message: message}); err != nil {
 			return message, err
 		}
-		if err := emit(MessageEndEvent{Type: "message_end", Message: message}); err != nil {
+		if err := emit(MessageEndEvent{Type: "message_end", MessageID: messageID, Message: message}); err != nil {
 			return message, err
 		}
 		return message, nil
@@ -367,10 +379,10 @@ func streamAssistantResponse(
 	if response == nil {
 		message := AssistantErrorMessage(signal, config.Model, errors.New("stream function returned nil stream"))
 		agentContext.Messages = append(agentContext.Messages, message)
-		if err := emit(MessageStartEvent{Type: "message_start", Message: message}); err != nil {
+		if err := emit(MessageStartEvent{Type: "message_start", MessageID: messageID, Message: message}); err != nil {
 			return message, err
 		}
-		if err := emit(MessageEndEvent{Type: "message_end", Message: message}); err != nil {
+		if err := emit(MessageEndEvent{Type: "message_end", MessageID: messageID, Message: message}); err != nil {
 			return message, err
 		}
 		return message, nil
@@ -389,7 +401,7 @@ func streamAssistantResponse(
 			}
 			agentContext.Messages = append(agentContext.Messages, partial)
 			addedPartial = true
-			if err := emit(MessageStartEvent{Type: "message_start", Message: partial}); err != nil {
+			if err := emit(MessageStartEvent{Type: "message_start", MessageID: messageID, Message: partial}); err != nil {
 				return partial, err
 			}
 
@@ -425,6 +437,7 @@ func streamAssistantResponse(
 			agentContext.Messages[len(agentContext.Messages)-1] = partial
 			if err := emit(MessageUpdateEvent{
 				Type:                  "message_update",
+				MessageID:             messageID,
 				Message:               partial,
 				AssistantMessageEvent: event,
 			}); err != nil {
@@ -440,11 +453,11 @@ func streamAssistantResponse(
 				agentContext.Messages[len(agentContext.Messages)-1] = finalMessage
 			} else {
 				agentContext.Messages = append(agentContext.Messages, finalMessage)
-				if err := emit(MessageStartEvent{Type: "message_start", Message: finalMessage}); err != nil {
+				if err := emit(MessageStartEvent{Type: "message_start", MessageID: messageID, Message: finalMessage}); err != nil {
 					return finalMessage, err
 				}
 			}
-			if err := emit(MessageEndEvent{Type: "message_end", Message: finalMessage}); err != nil {
+			if err := emit(MessageEndEvent{Type: "message_end", MessageID: messageID, Message: finalMessage}); err != nil {
 				return finalMessage, err
 			}
 			return finalMessage, nil
@@ -459,11 +472,11 @@ func streamAssistantResponse(
 		agentContext.Messages[len(agentContext.Messages)-1] = finalMessage
 	} else {
 		agentContext.Messages = append(agentContext.Messages, finalMessage)
-		if err := emit(MessageStartEvent{Type: "message_start", Message: finalMessage}); err != nil {
+		if err := emit(MessageStartEvent{Type: "message_start", MessageID: messageID, Message: finalMessage}); err != nil {
 			return finalMessage, err
 		}
 	}
-	if err := emit(MessageEndEvent{Type: "message_end", Message: finalMessage}); err != nil {
+	if err := emit(MessageEndEvent{Type: "message_end", MessageID: messageID, Message: finalMessage}); err != nil {
 		return finalMessage, err
 	}
 	return finalMessage, nil
@@ -933,14 +946,17 @@ func EmitToolResultMessage(
 	toolResultMessage ai.ToolResultMessage,
 	emit AgentEventSink,
 ) error {
+	messageID := newMessageID()
 	if err := emit(MessageStartEvent{
-		Type:    "message_start",
-		Message: toolResultMessage,
+		Type:      "message_start",
+		MessageID: messageID,
+		Message:   toolResultMessage,
 	}); err != nil {
 		return err
 	}
 	return emit(MessageEndEvent{
-		Type:    "message_end",
-		Message: toolResultMessage,
+		Type:      "message_end",
+		MessageID: messageID,
+		Message:   toolResultMessage,
 	})
 }

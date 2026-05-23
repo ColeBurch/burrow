@@ -385,7 +385,15 @@ func (s *SessionManager) base(t string) SessionEntryBase {
 }
 
 func (s *SessionManager) AppendMessage(ctx context.Context, m agent.AgentMessage) (string, error) {
-	e := &SessionMessageEntry{s.base("message"), m}
+	return s.AppendMessageWithID(ctx, generateID(), m)
+}
+
+func (s *SessionManager) AppendMessageWithID(ctx context.Context, id string, m agent.AgentMessage) (string, error) {
+	base := s.base("message")
+	if id != "" {
+		base.ID = id
+	}
+	e := &SessionMessageEntry{base, m}
 	if err := s.appendEntry(ctx, e); err != nil {
 		return "", err
 	}

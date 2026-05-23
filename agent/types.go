@@ -179,14 +179,16 @@ type TurnEndEvent struct {
 func (TurnEndEvent) EventType() string { return "turn_end" }
 
 type MessageStartEvent struct {
-	Type    string       `json:"type"`
-	Message AgentMessage `json:"message"`
+	Type      string       `json:"type"`
+	MessageID string       `json:"messageId"`
+	Message   AgentMessage `json:"message"`
 }
 
 func (MessageStartEvent) EventType() string { return "message_start" }
 
 type MessageUpdateEvent struct {
 	Type                  string       `json:"type"`
+	MessageID             string       `json:"messageId"`
 	Message               AgentMessage `json:"message"`
 	AssistantMessageEvent ai.AssistantMessageEvent
 }
@@ -194,8 +196,9 @@ type MessageUpdateEvent struct {
 func (MessageUpdateEvent) EventType() string { return "message_update" }
 
 type MessageEndEvent struct {
-	Type    string       `json:"type"`
-	Message AgentMessage `json:"message"`
+	Type      string       `json:"type"`
+	MessageID string       `json:"messageId"`
+	Message   AgentMessage `json:"message"`
 }
 
 func (MessageEndEvent) EventType() string { return "message_end" }

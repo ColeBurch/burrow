@@ -34,7 +34,7 @@ func NewAgentSession(a *agent.Agent, sm *SessionManager) *AgentSession {
 		a.Subscribe(func(event agent.AgentEvent, ctx context.Context) error {
 			switch e := event.(type) {
 			case agent.MessageEndEvent:
-				_, err := sm.AppendMessage(ctx, e.Message)
+				_, err := sm.AppendMessageWithID(ctx, e.MessageID, e.Message)
 				return err
 			}
 			return nil

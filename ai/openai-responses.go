@@ -1095,9 +1095,13 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 			},
 		}
 
-		CalculateCost(model, p.output.Usage)
-
 		var err error
+		p.output.Usage, err = CalculateCost(model, p.output.Usage)
+		if err != nil {
+			p.stream.End(err)
+			return
+		}
+
 		p.output.StopReason, err = MapOpenAIResponseStopReason(response.Status)
 		if err != nil {
 			p.output.StopReason = StopReasonError

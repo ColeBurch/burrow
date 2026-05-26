@@ -128,7 +128,7 @@ type SessionListProgress func(loaded, total int)
 type SessionStore interface {
 	CreateSession(ctx context.Context, header *SessionHeader) error
 	LoadSession(ctx context.Context, sessionID string) (*SessionHeader, []SessionEntry, error)
-	AppendEntry(ctx context.Context, sessionID string, entry SessionEntry) error
+	AppendEntry(ctx context.Context, header *SessionHeader, entry SessionEntry) error
 	ListSessions(ctx context.Context, metadata map[string]any) ([]SessionInfo, error)
 	FindMostRecentSession(ctx context.Context, metadata map[string]any) (*SessionInfo, error)
 	CreateBranch(ctx context.Context, fromLeafID string, newHeader SessionHeader) error
@@ -369,7 +369,7 @@ func (s *SessionManager) appendEntry(ctx context.Context, e SessionEntry) error 
 		if s.Store == nil {
 			return errors.New("store required for persistent session")
 		}
-		if err := s.Store.AppendEntry(ctx, s.sessionID, e); err != nil {
+		if err := s.Store.AppendEntry(ctx, s.Header, e); err != nil {
 			return err
 		}
 	}

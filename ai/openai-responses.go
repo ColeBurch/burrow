@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -140,8 +141,18 @@ func buildBaseOpenAIResponseOptions(options *SimpleStreamOptions, apiKey string)
 	return base
 }
 
+func httpHeadersToMap(headers http.Header) map[string]string {
+	result := make(map[string]string, len(headers))
+	for key, values := range headers {
+		if len(values) > 0 {
+			result[key] = values[0]
+		}
+	}
+	return result
+}
+
 func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext ModelContext, options *OpenAIResponseOptions) (*AssistantMessageEventStream, error) {
-	stream := NewAssistantMessageEventStream(16)
+	stream := NewAssistantMessageEventStream(64)
 
 	output := AssistantMessage{
 		Role:     RoleAssistant,
@@ -194,7 +205,46 @@ func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext Mo
 		return nil, err
 	}
 
-	openaiStream := client.Responses.NewStreaming(ctx, params)
+	if options.OnPayload != nil {
+		nextPayload, err := options.OnPayload(params, model)
+		if err != nil {
+			return nil, err
+		}
+
+		if nextPayload != nil {
+			nextParams, ok := nextPayload.(responses.ResponseNewParams)
+			if !ok {
+				return nil, fmt.Errorf("OnPayload returned %T, want responses.ResponseNewParams", nextPayload)
+			}
+			params = nextParams
+		}
+	}
+
+	requestOptions := []option.RequestOption{}
+
+	if options.OnResponse != nil {
+		requestOptions = append(requestOptions, option.WithMiddleware(
+			func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+				resp, err := next(req)
+				if err != nil {
+					return resp, err
+				}
+
+				if resp != nil {
+					if hookErr := options.OnResponse(ProviderResponse{
+						Status:  resp.StatusCode,
+						Headers: httpHeadersToMap(resp.Header),
+					}, model); hookErr != nil {
+						return resp, hookErr
+					}
+				}
+
+				return resp, nil
+			},
+		))
+	}
+
+	openaiStream := client.Responses.NewStreaming(ctx, params, requestOptions...)
 
 	processor := &responsesStreamProcessor{
 		output: &output,

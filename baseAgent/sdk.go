@@ -16,6 +16,34 @@ type CreateAgentSessionOptions struct {
 	SessionManager *SessionManager
 	ModelRegistry  *ModelRegistry
 	AuthStore      AuthStore
+
+	SystemPrompt      *string
+	Tools             []agent.AgentTool[any, any]
+	ToolExecutionMode *agent.ToolExecutionMode
+
+	/* Optional func to call before each tool call is executed. */
+	BeforeToolCall func(
+		ctx context.Context,
+		call agent.BeforeToolCallContext,
+	) (*agent.BeforeToolCallResult, error)
+
+	/* Optional func to call after each tool call is executed. */
+	AfterToolCall func(
+		ctx context.Context,
+		call agent.AfterToolCallContext[any],
+	) (*agent.AfterToolCallResult, error)
+
+	/* Optional func to call before each payload is sent to the provider. */
+	OnPayload func(
+		payload any,
+		model ai.Model[ai.API],
+	) (any, error)
+
+	/* Optional func to call after each response is received from the provider. */
+	OnResponse func(
+		response ai.ProviderResponse,
+		model ai.Model[ai.API],
+	) error
 }
 
 type CreateAgentSessionResult struct {
@@ -93,13 +121,28 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 	}
 	thinkingLevel = ai.ClampThinkingLevel(model, thinkingLevel)
 
+	systemPrompt := ""
+	if options.SystemPrompt != nil {
+		systemPrompt = *options.SystemPrompt
+	}
+
+	tools := options.Tools
+	if tools == nil {
+		tools = []agent.AgentTool[any, any]{}
+	}
+
+	toolExecution := agent.ToolExecutionModeParallel
+	if options.ToolExecutionMode != nil {
+		toolExecution = *options.ToolExecutionMode
+	}
+
 	sessionID := sessionManager.GetSessionID()
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{
-			SystemPrompt:  stringPtr(""),
+			SystemPrompt:  &systemPrompt,
 			Model:         &model,
 			ThinkingLevel: &thinkingLevel,
-			Tools:         []agent.AgentTool[any, any]{},
+			Tools:         tools,
 			Messages:      existingSession.Messages,
 		},
 		ConvertToLLM: ConvertToLLM,
@@ -110,7 +153,12 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 			}
 			return &key
 		},
-		SessionID: &sessionID,
+		SessionID:      &sessionID,
+		ToolExecution:  toolExecution,
+		BeforeToolCall: options.BeforeToolCall,
+		AfterToolCall:  options.AfterToolCall,
+		OnPayload:      options.OnPayload,
+		OnResponse:     options.OnResponse,
 	})
 
 	if !hasExistingSession {
@@ -127,8 +175,6 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 		ModelFallbackMessage: modelFallbackMessage,
 	}, nil
 }
-
-func stringPtr(value string) *string { return &value }
 
 func ensureDefaultAPIProvidersRegistered() {
 	if _, ok := ai.GetApiProvider(ai.APIOpenAIResponses); ok {

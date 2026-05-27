@@ -170,6 +170,9 @@ func TransformMessages(messages []Message, model Model[API], allowedToolCallProv
 					newContent = append(newContent, block)
 				}
 			}
+
+			assistantMsg.Content = newContent
+			transformedMessages = append(transformedMessages, assistantMsg)
 		}
 	}
 
@@ -218,8 +221,8 @@ func TransformMessages(messages []Message, model Model[API], allowedToolCallProv
 
 			toolCalls := []ToolCall{}
 			for _, block := range assistantMsg.Content {
-				if block.(ToolCall).Type == "toolCall" {
-					toolCalls = append(toolCalls, block.(ToolCall))
+				if toolCall, ok := block.(ToolCall); ok && toolCall.Type == "toolCall" {
+					toolCalls = append(toolCalls, toolCall)
 				}
 			}
 

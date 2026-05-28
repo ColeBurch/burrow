@@ -933,6 +933,7 @@ func CreateToolResultMessage(
 	finalized FinalizedToolCallOutcome,
 ) *ai.ToolResultMessage {
 	return &ai.ToolResultMessage{
+		Role:       ai.RoleToolResult,
 		ToolCallID: finalized.toolCall.Id,
 		ToolName:   finalized.toolCall.Name,
 		Content:    finalized.result.Content,

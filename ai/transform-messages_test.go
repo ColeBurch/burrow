@@ -84,6 +84,9 @@ func TestTransformMessagesDoesNotPanicOnNonToolAssistantContentWhenFindingToolCa
 	if !ok {
 		t.Fatalf("got[1] = %T, want synthetic ToolResultMessage", got[1])
 	}
+	if toolResult.Role != RoleToolResult {
+		t.Fatalf("synthetic tool result role = %q, want %q", toolResult.Role, RoleToolResult)
+	}
 	if toolResult.ToolCallID != "call-1" || toolResult.ToolName != "lookup" || !toolResult.IsError {
 		t.Fatalf("synthetic tool result = %#v, want call-1 lookup error result", toolResult)
 	}

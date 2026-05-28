@@ -418,6 +418,13 @@ func TestAgentLoopStopsAfterCurrentTurnWhenShouldStopAfterTurn(t *testing.T) {
 	if !reflect.DeepEqual(executed, []string{"hello"}) || polls != 1 || follow != 0 || !reflect.DeepEqual(ids, []string{"tool-1"}) || !reflect.DeepEqual(roles, []string{"user", "assistant", "toolResult"}) || len(msgs) != 3 {
 		t.Fatalf("bad stop state")
 	}
+	toolResult, ok := msgs[2].(ai.ToolResultMessage)
+	if !ok {
+		t.Fatalf("msgs[2] = %T, want ai.ToolResultMessage", msgs[2])
+	}
+	if toolResult.Role != ai.RoleToolResult {
+		t.Fatalf("tool result role = %q, want %q", toolResult.Role, ai.RoleToolResult)
+	}
 	want := []string{"agent_start", "turn_start", "message_start", "message_end", "message_start", "message_end", "tool_execution_start", "tool_execution_end", "message_start", "message_end", "turn_end", "agent_end"}
 	if !reflect.DeepEqual(eventTypes(events), want) {
 		t.Fatalf("events %v", eventTypes(events))

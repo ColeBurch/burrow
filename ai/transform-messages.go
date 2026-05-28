@@ -190,7 +190,7 @@ func TransformMessages(messages []Message, model Model[API], allowedToolCallProv
 		for _, tc := range pendingToolCalls {
 			if !existingToolResultIDs[tc.Id] {
 				result = append(result, ToolResultMessage{
-					Role:       RoleAssistant,
+					Role:       RoleToolResult,
 					ToolCallID: tc.Id,
 					ToolName:   tc.Name,
 					Content: []ToolResultContent{

@@ -21,11 +21,11 @@ func TestTransformMessagesPreservesAssistantMessages(t *testing.T) {
 			},
 		},
 		AssistantMessage{
-			Role:      RoleAssistant,
-			Api:       model.API,
-			Provider:  model.Provider,
-			Model:     model.ID,
-			Content:   []AssistantContent{TextContent{Type: ContentTypeText, Text: "hi there"}},
+			Role:       RoleAssistant,
+			Api:        model.API,
+			Provider:   model.Provider,
+			Model:      model.ID,
+			Content:    []AssistantContent{TextContent{Type: ContentTypeText, Text: "hi there"}},
 			StopReason: StopReasonStop,
 		},
 	}

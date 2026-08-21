@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -181,7 +183,7 @@ func TestAgentLoopBeforeToolCallMutatedArgsAreExecutedWithoutRevalidation(t *tes
 	}
 	cfg := baseConfig()
 	cfg.BeforeToolCall = func(_ context.Context, c BeforeToolCallContext) (*BeforeToolCallResult, error) {
-		c.args.(map[string]any)["value"] = 123
+		c.Args.(map[string]any)["value"] = 123
 		return nil, nil
 	}
 	first := assistantMsg([]ai.AssistantContent{ai.ToolCall{Type: ai.ContentTypeToolCall, Id: "tool-1", Name: "echo", Args: map[string]any{"value": "hello"}}}, ai.StopReasonToolUse)
@@ -216,18 +218,143 @@ func TestAgentLoopPrepareToolArgumentsForValidation(t *testing.T) {
 	}
 }
 
+func TestAgentLoopReportsImmediateToolFailuresAsErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		context AgentContext
+		call    ai.ToolCall
+	}{
+		{
+			name: "missing tool",
+			call: ai.ToolCall{Type: ai.ContentTypeToolCall, Id: "tool-1", Name: "missing", Args: map[string]any{}},
+		},
+		{
+			name:    "invalid arguments",
+			context: AgentContext{Tools: []AgentTool[any, any]{echoTool(nil)}},
+			call:    ai.ToolCall{Type: ai.ContentTypeToolCall, Id: "tool-1", Name: "echo", Args: map[string]any{}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assistantMessage := assistantMsg([]ai.AssistantContent{test.call}, ai.StopReasonToolUse)
+			batch, err := ExecuteToolCalls(
+				test.context,
+				assistantMessage,
+				baseConfig(),
+				context.Background(),
+				func(AgentEvent) error { return nil },
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(batch.message) != 1 {
+				t.Fatalf("expected one tool result, got %d", len(batch.message))
+			}
+			if !batch.message[0].IsError {
+				t.Fatalf("expected error result, got %#v", batch.message[0])
+			}
+		})
+	}
+}
+
+func TestAgentLoopDoesNotExecuteToolWhenPrepareArgumentsFails(t *testing.T) {
+	var executed atomic.Bool
+	tool := AgentTool[any, any]{
+		Tool: ai.Tool{
+			Name: "optional",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"value": map[string]any{"type": "string"},
+				},
+			},
+		},
+		PrepareArguments: func(any) (any, error) {
+			return nil, errors.New("argument preparation failed")
+		},
+		Execute: func(_ context.Context, _ string, _ any, _ AgentToolUpdateCallback[any]) (AgentToolResult[any], error) {
+			executed.Store(true)
+			return AgentToolResult[any]{Content: []ai.ToolResultContent{ai.TextContent{Type: ai.ContentTypeText, Text: "executed"}}}, nil
+		},
+	}
+	toolCall := ai.ToolCall{
+		Type: ai.ContentTypeToolCall,
+		Id:   "tool-1",
+		Name: "optional",
+		Args: map[string]any{"value": 42},
+	}
+	assistantMessage := assistantMsg([]ai.AssistantContent{toolCall}, ai.StopReasonToolUse)
+
+	batch, err := ExecuteToolCalls(
+		AgentContext{Tools: []AgentTool[any, any]{tool}},
+		assistantMessage,
+		baseConfig(),
+		context.Background(),
+		func(AgentEvent) error { return nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executed.Load() {
+		t.Fatal("tool executed after PrepareArguments returned an error")
+	}
+	if len(batch.message) != 1 || !batch.message[0].IsError {
+		t.Fatalf("expected one error result, got %#v", batch.message)
+	}
+}
+
+func TestExecuteToolCallsSequentialPropagatesToolUpdateEventSinkError(t *testing.T) {
+	sinkErr := errors.New("tool update sink failed")
+	tool := echoTool(nil)
+	tool.Execute = func(_ context.Context, _ string, _ any, onUpdate AgentToolUpdateCallback[any]) (AgentToolResult[any], error) {
+		onUpdate(AgentToolResult[any]{Content: []ai.ToolResultContent{
+			ai.TextContent{Type: ai.ContentTypeText, Text: "partial"},
+		}})
+		return AgentToolResult[any]{Content: []ai.ToolResultContent{
+			ai.TextContent{Type: ai.ContentTypeText, Text: "complete"},
+		}}, nil
+	}
+
+	toolCall := ai.ToolCall{
+		Type: ai.ContentTypeToolCall,
+		Id:   "tool-1",
+		Name: "echo",
+		Args: map[string]any{"value": "hello"},
+	}
+	assistantMessage := assistantMsg([]ai.AssistantContent{toolCall}, ai.StopReasonToolUse)
+
+	_, err := ExecuteToolCallsSequential(
+		AgentContext{Tools: []AgentTool[any, any]{tool}},
+		assistantMessage,
+		[]ai.ToolCall{toolCall},
+		baseConfig(),
+		context.Background(),
+		func(event AgentEvent) error {
+			if _, ok := event.(ToolExecutionUpdateEvent); ok {
+				return sinkErr
+			}
+			return nil
+		},
+	)
+	if !errors.Is(err, sinkErr) {
+		t.Fatalf("ExecuteToolCallsSequential error = %v, want %v", err, sinkErr)
+	}
+}
+
 func TestAgentLoopParallelCompletionOrderButSourceOrderResults(t *testing.T) {
-	firstResolved, parallelObserved := false, false
+	var firstResolved atomic.Bool
+	var parallelObserved atomic.Bool
 	release := make(chan struct{})
 	tool := echoTool(nil)
 	tool.Execute = func(_ context.Context, _ string, params any, _ AgentToolUpdateCallback[any]) (AgentToolResult[any], error) {
 		v := params.(map[string]any)["value"].(string)
 		if v == "first" {
 			<-release
-			firstResolved = true
+			firstResolved.Store(true)
 		}
-		if v == "second" && !firstResolved {
-			parallelObserved = true
+		if v == "second" && !firstResolved.Load() {
+			parallelObserved.Store(true)
 		}
 		return AgentToolResult[any]{Content: []ai.ToolResultContent{ai.TextContent{Type: ai.ContentTypeText, Text: v}}}, nil
 	}
@@ -252,8 +379,98 @@ func TestAgentLoopParallelCompletionOrderButSourceOrderResults(t *testing.T) {
 			}
 		}
 	}
-	if !parallelObserved || !reflect.DeepEqual(endIDs, []string{"tool-2", "tool-1"}) || !reflect.DeepEqual(resultIDs, []string{"tool-1", "tool-2"}) {
-		t.Fatalf("parallel=%v ends=%v results=%v", parallelObserved, endIDs, resultIDs)
+	if !parallelObserved.Load() || !reflect.DeepEqual(endIDs, []string{"tool-2", "tool-1"}) || !reflect.DeepEqual(resultIDs, []string{"tool-1", "tool-2"}) {
+		t.Fatalf("parallel=%v ends=%v results=%v", parallelObserved.Load(), endIDs, resultIDs)
+	}
+}
+
+func TestExecuteToolCallsParallelSerializesEventSink(t *testing.T) {
+	started := make(chan struct{}, 2)
+	releaseTools := make(chan struct{})
+	releaseSink := make(chan struct{})
+	toolsReleased := false
+	sinkReleased := false
+	defer func() {
+		if !toolsReleased {
+			close(releaseTools)
+		}
+		if !sinkReleased {
+			close(releaseSink)
+		}
+	}()
+
+	tool := echoTool(nil)
+	tool.Execute = func(_ context.Context, _ string, params any, _ AgentToolUpdateCallback[any]) (AgentToolResult[any], error) {
+		started <- struct{}{}
+		<-releaseTools
+		value := params.(map[string]any)["value"].(string)
+		return AgentToolResult[any]{Content: []ai.ToolResultContent{ai.TextContent{Type: ai.ContentTypeText, Text: value}}}, nil
+	}
+
+	toolCalls := []ai.ToolCall{
+		{Type: ai.ContentTypeToolCall, Id: "tool-1", Name: "echo", Args: map[string]any{"value": "first"}},
+		{Type: ai.ContentTypeToolCall, Id: "tool-2", Name: "echo", Args: map[string]any{"value": "second"}},
+	}
+	assistantMessage := assistantMsg([]ai.AssistantContent{toolCalls[0], toolCalls[1]}, ai.StopReasonToolUse)
+	sinkEntries := make(chan string, 2)
+	emit := func(event AgentEvent) error {
+		if end, ok := event.(ToolExecutionEndEvent); ok {
+			sinkEntries <- end.ToolCallID
+			<-releaseSink
+		}
+		return nil
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := ExecuteToolCallsParallel(
+			AgentContext{Tools: []AgentTool[any, any]{tool}},
+			assistantMessage,
+			toolCalls,
+			baseConfig(),
+			context.Background(),
+			emit,
+		)
+		done <- err
+	}()
+
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("parallel tools did not start")
+		}
+	}
+	close(releaseTools)
+	toolsReleased = true
+
+	var firstID string
+	select {
+	case firstID = <-sinkEntries:
+	case <-time.After(time.Second):
+		t.Fatal("first tool end event did not enter the sink")
+	}
+
+	var secondID string
+	select {
+	case secondID = <-sinkEntries:
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseSink)
+	sinkReleased = true
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("parallel tool execution did not finish")
+	}
+
+	if secondID != "" {
+		t.Fatalf("event sink calls overlapped: %s entered while %s was active", secondID, firstID)
 	}
 }
 
@@ -322,7 +539,8 @@ func TestAgentLoopSequentialExecutionModes(t *testing.T) {
 		wantParallel   bool
 	}{{"tool forces sequential", true, false, false}, {"all parallel", false, true, true}} {
 		t.Run(tc.name, func(t *testing.T) {
-			firstResolved, parallelObserved := false, false
+			var firstResolved atomic.Bool
+			var parallelObserved atomic.Bool
 			release := make(chan struct{})
 			tool := echoTool(nil)
 			if tc.slowSequential {
@@ -336,10 +554,10 @@ func TestAgentLoopSequentialExecutionModes(t *testing.T) {
 				v := params.(map[string]any)["value"].(string)
 				if v == "first" {
 					<-release
-					firstResolved = true
+					firstResolved.Store(true)
 				}
-				if v == "second" && !firstResolved {
-					parallelObserved = true
+				if v == "second" && !firstResolved.Load() {
+					parallelObserved.Store(true)
 				}
 				return AgentToolResult[any]{Content: []ai.ToolResultContent{ai.TextContent{Type: ai.ContentTypeText, Text: v}}}, nil
 			}
@@ -349,8 +567,8 @@ func TestAgentLoopSequentialExecutionModes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if parallelObserved != tc.wantParallel {
-				t.Fatalf("parallelObserved=%v", parallelObserved)
+			if parallelObserved.Load() != tc.wantParallel {
+				t.Fatalf("parallelObserved=%v", parallelObserved.Load())
 			}
 		})
 	}

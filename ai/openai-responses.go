@@ -88,6 +88,15 @@ type responsesStreamProcessor struct {
 	currentParts []responses.ResponseStreamEventUnionPart
 }
 
+func StreamOpenAIResponses(model Model[API], modelContext ModelContext, options *StreamOptions) (*AssistantMessageEventStream, error) {
+	var simpleOptions *SimpleStreamOptions
+	if options != nil {
+		simpleOptions = &SimpleStreamOptions{StreamOptions: *options}
+	}
+
+	return StreamSimpleOpenAIResponses(model, modelContext, simpleOptions)
+}
+
 func StreamSimpleOpenAIResponses(model Model[API], modelContext ModelContext, options *SimpleStreamOptions) (*AssistantMessageEventStream, error) {
 	apiKey := ""
 	if options != nil && options.ApiKey != nil {
@@ -750,10 +759,12 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 			p.currentItemType = "reasoning"
 			p.currentParts = nil
 
+			partial := *p.output
+			partial.Content = append([]AssistantContent(nil), p.output.Content...)
 			p.stream.Push(ThinkingStartEvent{
 				Type:         "thinking_start",
 				ContentIndex: int64(p.currentContentIndex),
-				Partial:      *p.output,
+				Partial:      partial,
 			})
 
 		case "message":
@@ -767,10 +778,12 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 			p.currentItemType = "message"
 			p.currentParts = nil
 
+			partial := *p.output
+			partial.Content = append([]AssistantContent(nil), p.output.Content...)
 			p.stream.Push(TextStartEvent{
 				Type:         "text_start",
 				ContentIndex: int64(p.currentContentIndex),
-				Partial:      *p.output,
+				Partial:      partial,
 			})
 
 		case "function_call":
@@ -788,10 +801,12 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 			p.currentContentIndex = len(p.output.Content) - 1
 			p.currentItemType = "function_call"
 
+			partial := *p.output
+			partial.Content = append([]AssistantContent(nil), p.output.Content...)
 			p.stream.Push(ToolCallStartEvent{
 				Type:         "toolcall_start",
 				ContentIndex: int64(p.currentContentIndex),
-				Partial:      *p.output,
+				Partial:      partial,
 			})
 		}
 	case "response.reasoning_summary_part.added":
@@ -818,11 +833,13 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 		last := &p.currentParts[len(p.currentParts)-1]
 		last.Text += event.Delta
 
+		partial := *p.output
+		partial.Content = append([]AssistantContent(nil), p.output.Content...)
 		p.stream.Push(ThinkingDeltaEvent{
 			Type:         "thinking_delta",
 			ContentIndex: int64(p.currentContentIndex),
 			Delta:        event.Delta,
-			Partial:      *p.output,
+			Partial:      partial,
 		})
 	case "response.reasoning_summary_part.done":
 		if p.currentItemType != "reasoning" || p.currentContentIndex < 0 {
@@ -846,11 +863,13 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 		last := &p.currentParts[len(p.currentParts)-1]
 		last.Text += delta
 
+		partial := *p.output
+		partial.Content = append([]AssistantContent(nil), p.output.Content...)
 		p.stream.Push(ThinkingDeltaEvent{
 			Type:         "thinking_delta",
 			ContentIndex: int64(p.currentContentIndex),
 			Delta:        delta,
-			Partial:      *p.output,
+			Partial:      partial,
 		})
 	case "response.content_part.added":
 		if p.currentItemType == "message" {
@@ -880,11 +899,13 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 
 		lastPart.Text += event.Delta
 
+		partial := *p.output
+		partial.Content = append([]AssistantContent(nil), p.output.Content...)
 		p.stream.Push(TextDeltaEvent{
 			Type:         "text_delta",
 			ContentIndex: int64(p.currentContentIndex),
 			Delta:        event.Delta,
-			Partial:      *p.output,
+			Partial:      partial,
 		})
 	case "response.refusal.delta":
 		if p.currentItemType != "message" || p.currentContentIndex < 0 {
@@ -910,11 +931,13 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 
 		lastPart.Refusal += event.Delta
 
+		partial := *p.output
+		partial.Content = append([]AssistantContent(nil), p.output.Content...)
 		p.stream.Push(TextDeltaEvent{
 			Type:         "text_delta",
 			ContentIndex: int64(p.currentContentIndex),
 			Delta:        event.Delta,
-			Partial:      *p.output,
+			Partial:      partial,
 		})
 	case "response.function_call_arguments.delta":
 		if p.currentItemType != "function_call" || p.currentContentIndex < 0 {
@@ -942,11 +965,13 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 
 		p.output.Content[p.currentContentIndex] = block
 
+		partial := *p.output
+		partial.Content = append([]AssistantContent(nil), p.output.Content...)
 		p.stream.Push(ToolCallDeltaEvent{
 			Type:         "toolcall_delta",
 			ContentIndex: int64(p.currentContentIndex),
 			Delta:        event.Delta,
-			Partial:      *p.output,
+			Partial:      partial,
 		})
 	case "response.function_call_arguments.done":
 		if p.currentItemType != "function_call" || p.currentContentIndex < 0 {
@@ -975,11 +1000,13 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 		if strings.HasPrefix(event.Arguments, previousPartialJSON) {
 			delta := event.Arguments[len(previousPartialJSON):]
 			if delta != "" {
+				partial := *p.output
+				partial.Content = append([]AssistantContent(nil), p.output.Content...)
 				p.stream.Push(ToolCallDeltaEvent{
 					Type:         "toolcall_delta",
 					ContentIndex: int64(p.currentContentIndex),
 					Delta:        delta,
-					Partial:      *p.output,
+					Partial:      partial,
 				})
 			}
 		}
@@ -1012,11 +1039,13 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 
 			p.output.Content[p.currentContentIndex] = block
 
+			partial := *p.output
+			partial.Content = append([]AssistantContent(nil), p.output.Content...)
 			p.stream.Push(ThinkingEndEvent{
 				Type:         "thinking_end",
 				ContentIndex: int64(p.currentContentIndex),
 				Content:      block.Thinking,
-				Partial:      *p.output,
+				Partial:      partial,
 			})
 
 			p.currentContentIndex = -1
@@ -1055,11 +1084,13 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 
 			p.output.Content[p.currentContentIndex] = block
 
+			partial := *p.output
+			partial.Content = append([]AssistantContent(nil), p.output.Content...)
 			p.stream.Push(TextEndEvent{
 				Type:         "text_end",
 				ContentIndex: int64(p.currentContentIndex),
 				Content:      block.Text,
-				Partial:      *p.output,
+				Partial:      partial,
 			})
 
 			p.currentContentIndex = -1
@@ -1109,11 +1140,13 @@ func (p *responsesStreamProcessor) ProcessResponsesStream(
 				p.currentContentIndex = len(p.output.Content) - 1
 			}
 
+			partial := *p.output
+			partial.Content = append([]AssistantContent(nil), p.output.Content...)
 			p.stream.Push(ToolCallEndEvent{
 				Type:         "toolcall_end",
 				ContentIndex: int64(p.currentContentIndex),
 				ToolCall:     toolCall,
-				Partial:      *p.output,
+				Partial:      partial,
 			})
 
 			p.currentContentIndex = -1

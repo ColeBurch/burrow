@@ -24,6 +24,15 @@ func newMessageID() string {
 
 type AgentEventSink func(event AgentEvent) error
 
+func serializeAgentEventSink(emit AgentEventSink) AgentEventSink {
+	var mu sync.Mutex
+	return func(event AgentEvent) error {
+		mu.Lock()
+		defer mu.Unlock()
+		return emit(event)
+	}
+}
+
 func AgentLoop(
 	prompts []AgentMessage,
 	context AgentContext,
@@ -559,6 +568,8 @@ func ExecuteToolCallsParallel(
 	signal context.Context,
 	emit AgentEventSink,
 ) (ExecutedToolCallBatch, error) {
+	emit = serializeAgentEventSink(emit)
+
 	type finalizedEntry struct {
 		finalized *FinalizedToolCallOutcome
 		run       func() (FinalizedToolCallOutcome, error)
@@ -683,19 +694,15 @@ func ExecuteToolCallsSequential(
 				isError:  preparation.(ImmediateToolOutcome).isError,
 			}
 		case PreparedToolCall:
-			executed, err := ExecutePreparedToolCall(preparation.(PreparedToolCall), signal, emit)
+			prepared := preparation.(PreparedToolCall)
+			executed, err := ExecutePreparedToolCall(prepared, signal, emit)
 			if err != nil {
-				finalized = FinalizedToolCallOutcome{
-					toolCall: toolCall,
-					result:   CreateErrorToolResult(err.Error()),
-					isError:  true,
-				}
-				continue
+				return ExecutedToolCallBatch{}, err
 			}
 			finalized = FinalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
-				preparation.(PreparedToolCall),
+				prepared,
 				executed,
 				&config,
 				signal,
@@ -732,17 +739,16 @@ func ShouldTerminateToolBatch(finalizedCalls []FinalizedToolCallOutcome) bool {
 	return true
 }
 
-func PrepareToolCallArguments(tool AgentTool[any, any], toolCall ai.ToolCall) ai.ToolCall {
+func PrepareToolCallArguments(tool AgentTool[any, any], toolCall ai.ToolCall) (ai.ToolCall, error) {
 	if tool.PrepareArguments == nil {
-		return toolCall
+		return toolCall, nil
 	}
 	args, err := tool.PrepareArguments(toolCall.Args)
 	if err != nil {
-		toolCall.Args = nil
-	} else {
-		toolCall.Args = args
+		return toolCall, err
 	}
-	return toolCall
+	toolCall.Args = args
+	return toolCall, nil
 }
 
 func CreateErrorToolResult(message string) AgentToolResult[any] {
@@ -769,22 +775,31 @@ func PrepareToolCall(
 
 	if toolIndex == -1 {
 		return ImmediateToolOutcome{
-			result: CreateErrorToolResult(fmt.Sprintf("Tool %s not found", toolCall.Name)),
+			result:  CreateErrorToolResult(fmt.Sprintf("Tool %s not found", toolCall.Name)),
+			isError: true,
 		}
 	}
 
-	preparedToolCall := PrepareToolCallArguments(currentContext.Tools[toolIndex], toolCall)
+	preparedToolCall, err := PrepareToolCallArguments(currentContext.Tools[toolIndex], toolCall)
+	if err != nil {
+		return ImmediateToolOutcome{
+			result:  CreateErrorToolResult(err.Error()),
+			isError: true,
+		}
+	}
+
 	validatedArgs, err := ai.ValidateToolArguments(currentContext.Tools[toolIndex].Tool, preparedToolCall)
 	if err != nil {
 		return ImmediateToolOutcome{
-			result: CreateErrorToolResult(err.Error()),
+			result:  CreateErrorToolResult(err.Error()),
+			isError: true,
 		}
 	}
 	if config.BeforeToolCall != nil {
 		result, err := config.BeforeToolCall(signal, BeforeToolCallContext{
 			AssistantMessage: assistantMessage,
 			ToolCall:         preparedToolCall,
-			args:             validatedArgs,
+			Args:             validatedArgs,
 			Context:          currentContext,
 		})
 		if err != nil {
@@ -881,7 +896,7 @@ func FinalizeExecutedToolCall(
 		afterResult, err := config.AfterToolCall(signal, AfterToolCallContext[any]{
 			AssistantMessage: assistantMessage,
 			ToolCall:         prepared.toolCall,
-			args:             prepared.args,
+			Args:             prepared.args,
 			Result:           result,
 			IsError:          isError,
 			Context:          currentContext,

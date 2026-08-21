@@ -183,6 +183,7 @@ func ensureDefaultAPIProvidersRegistered() {
 
 	ai.RegisterApiProvider(ai.ApiProvider[ai.API, ai.StreamOptions]{
 		Api:          ai.APIOpenAIResponses,
+		Stream:       ai.StreamOpenAIResponses,
 		StreamSimple: ai.StreamSimpleOpenAIResponses,
 	}, nil)
 }

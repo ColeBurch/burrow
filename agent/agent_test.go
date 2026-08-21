@@ -147,25 +147,31 @@ func TestAgentWaitForIdleWaitsForSubscribers(t *testing.T) {
 }
 
 func TestAgentPassesActiveAbortSignalToSubscribers(t *testing.T) {
-	var received context.Context
+	received := make(chan context.Context, 1)
 	a := NewAgent(&AgentOptions{StreamFn: func(ctx context.Context, _ ai.Model[ai.API], _ ai.ModelContext, _ *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
 		return neverEndingUntilAbortStream(ctx), nil
 	}})
 	a.Subscribe(func(e AgentEvent, ctx context.Context) error {
 		if e.EventType() == "agent_start" {
-			received = ctx
+			received <- ctx
 		}
 		return nil
 	})
 	done := make(chan error, 1)
 	go func() { done <- a.PromptText(context.Background(), "hello") }()
-	time.Sleep(10 * time.Millisecond)
-	if received == nil || received.Err() != nil {
+
+	var signal context.Context
+	select {
+	case signal = <-received:
+	case <-time.After(time.Second):
+		t.Fatal("subscriber did not receive the signal")
+	}
+	if signal.Err() != nil {
 		t.Fatalf("signal not active")
 	}
 	a.Abort()
 	<-done
-	if received.Err() == nil {
+	if signal.Err() == nil {
 		t.Fatalf("signal was not aborted")
 	}
 }

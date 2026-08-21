@@ -25,6 +25,9 @@ func Complete(model Model[API], modelContext ModelContext, options *StreamOption
 		return AssistantMessage{}, err
 	}
 
+	// The event channel is bounded. Drain it so a full channel cannot block the producer before the terminal event.
+	for range s.Events() {
+	}
 	return s.Result()
 }
 
@@ -43,5 +46,8 @@ func CompleteSimple(model Model[API], modelContext ModelContext, options *Simple
 		return AssistantMessage{}, err
 	}
 
+	// The event channel is bounded. Drain it so a full channel cannot block the producer before the terminal event.
+	for range s.Events() {
+	}
 	return s.Result()
 }

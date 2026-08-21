@@ -193,6 +193,5 @@ func (s *AgentSession) Prompt(ctx context.Context, text string, options *PromptO
 		}
 	}
 
-	s.Agent.PromptMessage(ctx, message)
-	return nil
+	return s.Agent.PromptMessage(ctx, message)
 }

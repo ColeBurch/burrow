@@ -57,6 +57,9 @@ func wrapStream[TApi API](
 		if model.API != API(api) {
 			return nil, fmt.Errorf("mismatched api: %s expected %s", model.API, api)
 		}
+		if stream == nil {
+			return nil, fmt.Errorf("API provider %s does not implement Stream", api)
+		}
 
 		typedModel := modelWithAPI(model, api)
 
@@ -75,6 +78,9 @@ func wrapStreamSimple[TApi API](
 	) (*AssistantMessageEventStream, error) {
 		if model.API != API(api) {
 			return nil, fmt.Errorf("mismatched api: %s expected %s", model.API, api)
+		}
+		if streamSimple == nil {
+			return nil, fmt.Errorf("API provider %s does not implement StreamSimple", api)
 		}
 
 		typedModel := modelWithAPI(model, api)

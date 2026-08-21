@@ -81,7 +81,7 @@ type BeforeToolCallContext struct {
 	/** The raw tool call block from `assistantMessage.content`. */
 	ToolCall ai.ToolCall
 	/** Validated tool arguments for the target tool schema. */
-	args any
+	Args any
 	/** Current agent context at the time the tool call is prepared. */
 	Context AgentContext
 }
@@ -92,7 +92,7 @@ type AfterToolCallContext[TDetails any] struct {
 	/** The raw tool call block from `assistantMessage.content`. */
 	ToolCall ai.ToolCall
 	/** Validated tool arguments for the target tool schema. */
-	args any
+	Args any
 	/** The executed tool result before any `afterToolCall` overrides are applied. */
 	Result AgentToolResult[TDetails]
 	/** Whether the executed tool result is currently treated as an error. */

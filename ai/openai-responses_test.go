@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -74,6 +75,80 @@ func requireToolArgsMap(t *testing.T, args any) map[string]any {
 		t.Fatalf("tool args = %T, want map[string]any", args)
 	}
 	return argsMap
+}
+
+func TestResponsesStreamProcessorPartialEventsAreSafeForConcurrentReaders(t *testing.T) {
+	model := testResponsesModel()
+	processor, stream := newTestResponsesStreamProcessor(model)
+	readerStarted := make(chan struct{})
+	producerDone := make(chan struct{})
+	readsDone := make(chan int64, 1)
+
+	go func() {
+		for event := range stream.Events() {
+			delta, ok := event.(TextDeltaEvent)
+			if !ok {
+				continue
+			}
+
+			partial := delta.Partial
+			close(readerStarted)
+
+			var reads int64
+			for {
+				select {
+				case <-producerDone:
+					readsDone <- reads
+					return
+				default:
+					if len(partial.Content) > 0 {
+						if text, ok := partial.Content[0].(TextContent); ok {
+							reads += int64(len(text.Text))
+						}
+					}
+					runtime.Gosched()
+				}
+			}
+		}
+	}()
+
+	processor.ProcessResponsesStream(responses.ResponseStreamEventUnion{
+		Type: "response.output_item.added",
+		Item: responses.ResponseOutputItemUnion{Type: "message"},
+	}, model, nil)
+	processor.ProcessResponsesStream(responses.ResponseStreamEventUnion{
+		Type: "response.content_part.added",
+		Part: responses.ResponseStreamEventUnionPart{Type: "output_text"},
+	}, model, nil)
+	processor.ProcessResponsesStream(responses.ResponseStreamEventUnion{
+		Type:  "response.output_text.delta",
+		Delta: "a",
+	}, model, nil)
+
+	select {
+	case <-readerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("the partial event reader did not start")
+	}
+
+	for range 32 {
+		processor.ProcessResponsesStream(responses.ResponseStreamEventUnion{
+			Type:  "response.output_text.delta",
+			Delta: "b",
+		}, model, nil)
+	}
+
+	close(producerDone)
+	stream.End(nil)
+
+	select {
+	case reads := <-readsDone:
+		if reads == 0 {
+			t.Fatal("the consumer did not read the partial message")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the partial event reader did not stop")
+	}
 }
 
 func TestResponsesStreamProcessorTextEvents(t *testing.T) {

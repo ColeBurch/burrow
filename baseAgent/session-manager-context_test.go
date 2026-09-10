@@ -1,6 +1,7 @@
 package baseAgent
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -217,4 +218,133 @@ func TestBuildSessionContextEdgeCases(t *testing.T) {
 			t.Fatalf("len = %d", len(ctx.Messages))
 		}
 	})
+}
+
+func resetLeafUserMessage(text string) ai.UserMessage {
+	return ai.UserMessage{
+		Role: ai.RoleUser,
+		Content: []ai.UserContent{
+			ai.TextContent{Type: ai.ContentTypeText, Text: text},
+		},
+	}
+}
+
+func TestSessionManagerResetLeafBuildsEmptyContext(t *testing.T) {
+	ctx := context.Background()
+	sm, err := InMemorySessionManager(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sm.AppendMessage(ctx, resetLeafUserMessage("Use SQLite")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sm.AppendThinkingLevelChange(ctx, "high"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sm.AppendModelChange(ctx, "openai", "gpt-test"); err != nil {
+		t.Fatal(err)
+	}
+
+	sm.ResetLeaf()
+	got := sm.BuildSessionContext()
+
+	if len(got.Messages) != 0 {
+		t.Errorf("message count after ResetLeaf = %d, want 0", len(got.Messages))
+	}
+	if got.ThinkingLevel != "off" {
+		t.Errorf("thinking level after ResetLeaf = %q, want %q", got.ThinkingLevel, "off")
+	}
+	if got.Model != nil {
+		t.Errorf("model after ResetLeaf = %#v, want nil", got.Model)
+	}
+}
+
+func TestSessionManagerAppendAfterResetCreatesIsolatedRoot(t *testing.T) {
+	ctx := context.Background()
+	sm, err := InMemorySessionManager(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sm.AppendMessage(ctx, resetLeafUserMessage("Use SQLite")); err != nil {
+		t.Fatal(err)
+	}
+
+	sm.ResetLeaf()
+	newID, err := sm.AppendMessage(ctx, resetLeafUserMessage("Use PostgreSQL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newEntry := sm.GetEntry(newID)
+	if newEntry == nil {
+		t.Fatal("new root entry was not found")
+	}
+	if newEntry.GetBase().ParentID != nil {
+		t.Errorf("new root parent = %q, want nil", *newEntry.GetBase().ParentID)
+	}
+
+	tree := sm.GetTree()
+	if len(tree) != 2 {
+		t.Errorf("root count = %d, want 2", len(tree))
+	}
+
+	got := sm.BuildSessionContext()
+	if len(got.Messages) != 1 {
+		t.Fatalf("message count for new root = %d, want 1", len(got.Messages))
+	}
+	if text := userText(t, got.Messages[0]); text != "Use PostgreSQL" {
+		t.Errorf("new root message = %q, want %q", text, "Use PostgreSQL")
+	}
+}
+
+func TestSessionManagerResetLeafAfterCompactionBuildsEmptyContext(t *testing.T) {
+	ctx := context.Background()
+	sm, err := InMemorySessionManager(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstID, err := sm.AppendMessage(ctx, resetLeafUserMessage("old root"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sm.AppendCompaction(ctx, "old summary", firstID, 1000, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	sm.ResetLeaf()
+	got := sm.BuildSessionContext()
+
+	if len(got.Messages) != 0 {
+		t.Fatalf("message count after resetting a compacted branch = %d, want 0", len(got.Messages))
+	}
+}
+
+func TestSessionManagerResetLeafDoesNotSelectLatestRoot(t *testing.T) {
+	ctx := context.Background()
+	sm, err := InMemorySessionManager(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstRootID, err := sm.AppendMessage(ctx, resetLeafUserMessage("first root"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm.ResetLeaf()
+	if _, err := sm.AppendMessage(ctx, resetLeafUserMessage("latest root")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sm.SetLeaf(firstRootID); err != nil {
+		t.Fatal(err)
+	}
+
+	sm.ResetLeaf()
+	got := sm.BuildSessionContext()
+
+	if len(got.Messages) != 0 {
+		t.Fatalf("message count after resetting from an older root = %d, want 0", len(got.Messages))
+	}
 }

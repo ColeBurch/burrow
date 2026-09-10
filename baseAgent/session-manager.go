@@ -531,6 +531,14 @@ func (s *SessionManager) GetBranch(from ...string) []SessionEntry {
 }
 
 func (s *SessionManager) BuildSessionContext() SessionContext {
+	if s.leafID == nil {
+		return SessionContext{
+			Messages:      []agent.AgentMessage{},
+			ThinkingLevel: "off",
+			Model:         nil,
+		}
+	}
+
 	return BuildSessionContext(s.GetEntries(), s.leafID, s.byID)
 }
 

@@ -363,6 +363,20 @@ func (a *Agent) State() AgentState {
 	return state
 }
 
+// ReplaceMessages replaces the conversation transcript while the agent is idle.
+// The top-level slice is copied so later changes to the input do not change agent state.
+func (a *Agent) ReplaceMessages(messages []AgentMessage) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.activeRun != nil {
+		return fmt.Errorf("cannot replace messages while the agent is processing")
+	}
+
+	a.state.Messages = append([]AgentMessage(nil), messages...)
+	return nil
+}
+
 func (a *Agent) SteeringMode() QueueMode {
 	return a.steeringQueue.Mode()
 }

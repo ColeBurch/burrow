@@ -11,11 +11,12 @@ import (
 const DefaultThinkingLevel = ai.ThinkingLevelMedium
 
 type CreateAgentSessionOptions struct {
-	Model          ai.Model[ai.API]
-	ThinkingLevel  ai.ModelThinkingLevel
-	SessionManager *SessionManager
-	ModelRegistry  *ModelRegistry
-	AuthStore      AuthStore
+	Model              ai.Model[ai.API]
+	ThinkingLevel      ai.ModelThinkingLevel
+	SessionManager     *SessionManager
+	ModelRegistry      *ModelRegistry
+	AuthStore          AuthStore
+	CompactionSettings *CompactionSettings
 
 	SystemPrompt      *string
 	Tools             []agent.AgentTool[any, any]
@@ -170,8 +171,13 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 		}
 	}
 
+	session := NewAgentSession(a, sessionManager)
+	if options.CompactionSettings != nil {
+		session.SetCompactionSettings(*options.CompactionSettings)
+	}
+
 	return &CreateAgentSessionResult{
-		Session:              NewAgentSession(a, sessionManager),
+		Session:              session,
 		ModelFallbackMessage: modelFallbackMessage,
 	}, nil
 }

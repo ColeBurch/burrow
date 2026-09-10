@@ -49,6 +49,92 @@ func TestAgentCreatesCustomInitialState(t *testing.T) {
 	}
 }
 
+func TestAgentReplacesMessages(t *testing.T) {
+	a := NewAgent(&AgentOptions{
+		InitialState: &InitialAgentState{
+			Messages: []AgentMessage{userMsg("old context")},
+		},
+	})
+
+	if err := a.ReplaceMessages([]AgentMessage{userMsg("compacted context")}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := a.State().Messages
+	if len(got) != 1 {
+		t.Fatalf("message count = %d, want 1", len(got))
+	}
+	user, ok := got[0].(ai.UserMessage)
+	if !ok {
+		t.Fatalf("message type = %T, want ai.UserMessage", got[0])
+	}
+	if text := userText(user); text != "compacted context" {
+		t.Fatalf("message text = %q, want %q", text, "compacted context")
+	}
+}
+
+func TestAgentReplaceMessagesCopiesInputSlice(t *testing.T) {
+	a := NewAgent(nil)
+	replacement := []AgentMessage{userMsg("compacted context")}
+
+	if err := a.ReplaceMessages(replacement); err != nil {
+		t.Fatal(err)
+	}
+	replacement[0] = userMsg("mutated context")
+
+	got := a.State().Messages
+	if len(got) != 1 {
+		t.Fatalf("message count = %d, want 1", len(got))
+	}
+	user, ok := got[0].(ai.UserMessage)
+	if !ok {
+		t.Fatalf("message type = %T, want ai.UserMessage", got[0])
+	}
+	if text := userText(user); text != "compacted context" {
+		t.Fatalf("stored message changed to %q", text)
+	}
+}
+
+func TestAgentRejectsMessageReplacementWhileRunning(t *testing.T) {
+	started := make(chan struct{})
+	a := NewAgent(&AgentOptions{
+		StreamFn: func(ctx context.Context, _ ai.Model[ai.API], _ ai.ModelContext, _ *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
+			close(started)
+			return neverEndingUntilAbortStream(ctx), nil
+		},
+	})
+
+	promptDone := make(chan error, 1)
+	go func() {
+		promptDone <- a.PromptText(context.Background(), "active prompt")
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("agent did not start")
+	}
+	defer func() {
+		a.Abort()
+		<-promptDone
+	}()
+
+	err := a.ReplaceMessages([]AgentMessage{userMsg("replacement")})
+	if err == nil {
+		t.Fatal("ReplaceMessages succeeded during an active run")
+	}
+	if !strings.Contains(err.Error(), "processing") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, message := range a.State().Messages {
+		user, ok := message.(ai.UserMessage)
+		if ok && userText(user) == "replacement" {
+			t.Fatal("rejected replacement changed agent messages")
+		}
+	}
+}
+
 func TestAgentSubscribeUnsubscribeAndNoStateEvents(t *testing.T) {
 	a := NewAgent(nil)
 	count := 0

@@ -25,6 +25,9 @@ type CompactionResult struct {
 	Summary          string
 	FirstKeptEntryID string
 	TokensBefore     int64
+	// Details is stored on the CompactionEntry and must marshal to JSON. The next
+	// compaction receives it as CompactionPreparation.PreviousDetails.
+	Details any
 }
 
 var DEFAULT_COMPACTION_SETTINGS = CompactionSettings{
@@ -53,7 +56,22 @@ type CompactionPreparation struct {
 	IsSplitTurn         bool
 	TokensBefore        int64
 	PreviousSummary     *string
-	Settings            CompactionSettings
+	// PreviousDetails is the previous compaction's Details as JSON, so it reads
+	// the same before and after a reload. Decode it with DecodeCompactionDetails.
+	PreviousDetails json.RawMessage
+	Settings        CompactionSettings
+}
+
+// DecodeCompactionDetails decodes details stored by a previous compaction.
+// ok is false when the previous compaction stored no details.
+func DecodeCompactionDetails[T any](raw json.RawMessage) (details T, ok bool, err error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return details, false, nil
+	}
+	if err := json.Unmarshal(raw, &details); err != nil {
+		return details, false, fmt.Errorf("decode compaction details: %w", err)
+	}
+	return details, true, nil
 }
 
 // Message Extraction
@@ -300,6 +318,13 @@ func FindTurnStartIndex(entries []SessionEntry, entryIndex, startIndex int) int 
 	return -1
 }
 
+// isUnseenAssistantMessage reports whether ai.TransformMessages drops message
+// before it reaches the provider.
+func isUnseenAssistantMessage(message agent.AgentMessage) bool {
+	assistant, ok := message.(ai.AssistantMessage)
+	return ok && (assistant.StopReason == ai.StopReasonError || assistant.StopReason == ai.StopReasonAborted)
+}
+
 // FindCutPoint finds the entry that keeps approximately keepRecentTokens.
 func FindCutPoint(entries []SessionEntry, startIndex, endIndex int, keepRecentTokens int64) CutPointResult {
 	cutPoints := findValidCutPoints(entries, startIndex, endIndex)
@@ -317,6 +342,11 @@ func FindCutPoint(entries []SessionEntry, startIndex, endIndex int, keepRecentTo
 	for i := endIndex - 1; i >= startIndex; i-- {
 		entry, ok := entries[i].(*SessionMessageEntry)
 		if !ok || entry == nil || entry.Message == nil {
+			continue
+		}
+		// Error and aborted replies never reach the model, so they must not use
+		// the recent-token budget. They stay cut points for when nothing else fits.
+		if isUnseenAssistantMessage(entry.Message) {
 			continue
 		}
 
@@ -440,11 +470,48 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact names, identifiers, values, and error messages.`
 
+// SummaryPrompts are the prompts used to generate compaction summaries. Empty
+// fields use the defaults from DefaultSummaryPrompts.
+type SummaryPrompts struct {
+	System string
+	// Initial asks for a new summary; Update merges into <previous-summary>.
+	Initial    string
+	Update     string
+	TurnPrefix string
+}
+
+func DefaultSummaryPrompts() SummaryPrompts {
+	return SummaryPrompts{
+		System:     SUMMARIZATION_SYSTEM_PROMPT,
+		Initial:    SUMMARIZATION_PROMPT,
+		Update:     UPDATE_SUMMARIZATION_PROMPT,
+		TurnPrefix: TURN_PREFIX_SUMMARIZATION_PROMPT,
+	}
+}
+
+func (p SummaryPrompts) withDefaults() SummaryPrompts {
+	defaults := DefaultSummaryPrompts()
+	if p.System == "" {
+		p.System = defaults.System
+	}
+	if p.Initial == "" {
+		p.Initial = defaults.Initial
+	}
+	if p.Update == "" {
+		p.Update = defaults.Update
+	}
+	if p.TurnPrefix == "" {
+		p.TurnPrefix = defaults.TurnPrefix
+	}
+	return p
+}
+
 type GenerateSummaryOptions struct {
 	Headers            map[string]string
 	CustomInstructions string
 	PreviousSummary    string
 	ThinkingLevel      ai.ModelThinkingLevel
+	Prompts            SummaryPrompts
 }
 
 /**
@@ -460,16 +527,21 @@ func GenerateSummary(
 	options *GenerateSummaryOptions,
 ) (string, error) {
 	maxTokens := reserveTokens * 4 / 5
-	basePrompt := SUMMARIZATION_PROMPT
 	var headers map[string]string
 	var previousSummary string
 	var thinkingLevel ai.ModelThinkingLevel
+	var prompts SummaryPrompts
+	if options != nil {
+		prompts = options.Prompts
+	}
+	prompts = prompts.withDefaults()
+	basePrompt := prompts.Initial
 
 	if options != nil {
 		headers = options.Headers
 		previousSummary = options.PreviousSummary
 		if previousSummary != "" {
-			basePrompt = UPDATE_SUMMARIZATION_PROMPT
+			basePrompt = prompts.Update
 		}
 		thinkingLevel = options.ThinkingLevel
 		if options.CustomInstructions != "" {
@@ -489,7 +561,7 @@ func GenerateSummary(
 	}
 	prompt.WriteString(basePrompt)
 
-	systemPrompt := SUMMARIZATION_SYSTEM_PROMPT
+	systemPrompt := prompts.System
 	summarizationMessage := ai.UserMessage{
 		Role: ai.RoleUser,
 		Content: []ai.UserContent{
@@ -682,6 +754,7 @@ func PrepareCompaction(
 	}
 
 	var previousSummary *string
+	var previousDetails json.RawMessage
 	boundaryStart := 0
 
 	if previousCompactionIndex >= 0 {
@@ -689,6 +762,13 @@ func PrepareCompaction(
 			pathEntries[previousCompactionIndex].(*CompactionEntry)
 		summary := previousCompaction.Summary
 		previousSummary = &summary
+		if previousCompaction.Details != nil {
+			// AgentSession stores details as JSON already. Entries appended directly
+			// with unmarshalable details are treated as having none.
+			if raw, err := json.Marshal(previousCompaction.Details); err == nil {
+				previousDetails = raw
+			}
+		}
 
 		firstKeptIndex := -1
 		for i, entry := range pathEntries {
@@ -759,6 +839,7 @@ func PrepareCompaction(
 		IsSplitTurn:         cutPoint.IsSplitTurn,
 		TokensBefore:        tokensBefore,
 		PreviousSummary:     previousSummary,
+		PreviousDetails:     previousDetails,
 		Settings:            settings,
 	}
 }
@@ -768,6 +849,7 @@ type CompactOptions struct {
 	Headers            map[string]string
 	CustomInstructions string
 	ThinkingLevel      ai.ModelThinkingLevel
+	Prompts            SummaryPrompts
 }
 
 // Compact generates summaries from prepared compaction data.
@@ -785,11 +867,14 @@ func Compact(
 	var headers map[string]string
 	var customInstructions string
 	var thinkingLevel ai.ModelThinkingLevel
+	var prompts SummaryPrompts
 	if options != nil {
 		headers = options.Headers
 		customInstructions = options.CustomInstructions
 		thinkingLevel = options.ThinkingLevel
+		prompts = options.Prompts
 	}
+	prompts = prompts.withDefaults()
 
 	previousSummary := ""
 	if preparation.PreviousSummary != nil {
@@ -801,6 +886,7 @@ func Compact(
 		CustomInstructions: customInstructions,
 		PreviousSummary:    previousSummary,
 		ThinkingLevel:      thinkingLevel,
+		Prompts:            prompts,
 	}
 
 	var summary string
@@ -837,6 +923,7 @@ func Compact(
 				apiKey,
 				headers,
 				thinkingLevel,
+				prompts,
 			)
 		}()
 
@@ -884,11 +971,12 @@ func generateTurnPrefixSummary(
 	apiKey string,
 	headers map[string]string,
 	thinkingLevel ai.ModelThinkingLevel,
+	prompts SummaryPrompts,
 ) (string, error) {
 	maxTokens := reserveTokens / 2
 	conversationText := serializeConversation(ConvertToLLM(messages))
-	promptText := "<conversation>\n" + conversationText + "\n</conversation>\n\n" + TURN_PREFIX_SUMMARIZATION_PROMPT
-	systemPrompt := SUMMARIZATION_SYSTEM_PROMPT
+	promptText := "<conversation>\n" + conversationText + "\n</conversation>\n\n" + prompts.TurnPrefix
+	systemPrompt := prompts.System
 	summarizationMessage := ai.UserMessage{
 		Role: ai.RoleUser,
 		Content: []ai.UserContent{

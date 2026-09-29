@@ -17,6 +17,8 @@ type CreateAgentSessionOptions struct {
 	ModelRegistry      *ModelRegistry
 	AuthStore          AuthStore
 	CompactionSettings *CompactionSettings
+	// CompactionHook wraps manual and automatic compaction. See CompactionHook.
+	CompactionHook CompactionHook
 
 	SystemPrompt      *string
 	Tools             []agent.AgentTool[any, any]
@@ -175,6 +177,7 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 	if options.CompactionSettings != nil {
 		session.SetCompactionSettings(*options.CompactionSettings)
 	}
+	session.SetCompactionHook(options.CompactionHook)
 
 	return &CreateAgentSessionResult{
 		Session:              session,

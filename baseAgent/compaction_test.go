@@ -2,11 +2,14 @@ package baseAgent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1068,6 +1071,52 @@ func TestFindCutPointKeepsEverythingWithinBudget(t *testing.T) {
 	}
 }
 
+func TestFindCutPointIgnoresRepliesTheModelNeverSees(t *testing.T) {
+	for _, stopReason := range []ai.StopReason{ai.StopReasonAborted, ai.StopReasonError} {
+		t.Run(string(stopReason), func(t *testing.T) {
+			// A long partial reply that TransformMessages drops before the provider.
+			unseen := testAssistantMessage(strings.Repeat("x", 400), ai.Usage{}, stopReason)
+			entries := []SessionEntry{
+				testMessageEntry("user-1", testUserMessage("abcd")),
+				testMessageEntry("assistant-1", cutPointAssistantMessage("abcd")),
+				testMessageEntry("user-2", testUserMessage("abcd")),
+				testMessageEntry("unseen", unseen),
+			}
+
+			// user-2 alone fills the budget; the unseen reply must not.
+			got := FindCutPoint(entries, 0, len(entries), 1)
+			want := CutPointResult{FirstKeptEntryIndex: 2, TurnStartIndex: -1, IsSplitTurn: false}
+			if got != want {
+				t.Fatalf("FindCutPoint() = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestFindCutPointCanCutAtUnseenReplyWhenNothingElseFits(t *testing.T) {
+	// Overflow recovery after a huge tool result: the only cut point after the
+	// result is the overflow error, so the whole turn must become the prefix.
+	overflow := testAssistantMessage("", ai.Usage{}, ai.StopReasonError)
+	overflow.ErrorMessage = "prompt is too long"
+	entries := []SessionEntry{
+		testMessageEntry("user", testUserMessage("abcd")),
+		testMessageEntry("assistant", ai.AssistantMessage{
+			Role: ai.RoleAssistant,
+			Content: []ai.AssistantContent{
+				ai.ToolCall{Type: ai.ContentTypeToolCall, Id: "call-id", Name: "run", Args: nil},
+			},
+		}),
+		testMessageEntry("tool-result", testToolResultMessage(strings.Repeat("x", 4000))),
+		testMessageEntry("overflow", overflow),
+	}
+
+	got := FindCutPoint(entries, 0, len(entries), 2)
+	want := CutPointResult{FirstKeptEntryIndex: 3, TurnStartIndex: 0, IsSplitTurn: true}
+	if got != want {
+		t.Fatalf("FindCutPoint() = %#v, want %#v", got, want)
+	}
+}
+
 func cutPointAssistantMessage(text string) ai.AssistantMessage {
 	return testAssistantMessage(text, ai.Usage{}, "")
 }
@@ -1923,6 +1972,61 @@ func TestGenerateSummaryReturnsOnlyTextContent(t *testing.T) {
 	}
 }
 
+func TestCompactUsesCustomSummaryPrompts(t *testing.T) {
+	var mu sync.Mutex
+	var systemPrompts []string
+	var prompts []string
+	model := registerSummaryTestProvider(t, false, func(
+		_ ai.Model[ai.API],
+		modelContext ai.ModelContext,
+		_ *ai.SimpleStreamOptions,
+	) (*ai.AssistantMessageEventStream, error) {
+		mu.Lock()
+		systemPrompts = append(systemPrompts, *modelContext.SystemPrompt)
+		prompts = append(prompts, summaryTestPrompt(t, modelContext))
+		mu.Unlock()
+		return completedSummaryTestStream(ai.AssistantMessage{
+			Content:    []ai.AssistantContent{ai.TextContent{Type: ai.ContentTypeText, Text: "summary"}},
+			StopReason: ai.StopReasonStop,
+		}), nil
+	})
+
+	previousSummary := "previous summary"
+	preparation := &CompactionPreparation{
+		FirstKeptEntryID: "kept-entry",
+		MessagesToSummarize: []agent.AgentMessage{
+			ai.UserMessage{Role: ai.RoleUser, Content: []ai.UserContent{ai.TextContent{Type: ai.ContentTypeText, Text: "history"}}},
+		},
+		TurnPrefixMessages: []agent.AgentMessage{
+			ai.UserMessage{Role: ai.RoleUser, Content: []ai.UserContent{ai.TextContent{Type: ai.ContentTypeText, Text: "prefix"}}},
+		},
+		IsSplitTurn:     true,
+		PreviousSummary: &previousSummary,
+		Settings:        CompactionSettings{ReservedTokens: 100},
+	}
+	_, err := Compact(context.Background(), preparation, model, "test-key", &CompactOptions{
+		Prompts: SummaryPrompts{
+			System:     "custom system",
+			Initial:    "custom initial",
+			Update:     "custom update",
+			TurnPrefix: "custom turn prefix",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+
+	sort.Strings(prompts)
+	if len(prompts) != 2 ||
+		!strings.Contains(prompts[0], "history") || !strings.HasSuffix(prompts[0], "</previous-summary>\n\ncustom update") ||
+		!strings.Contains(prompts[1], "prefix") || !strings.HasSuffix(prompts[1], "</conversation>\n\ncustom turn prefix") {
+		t.Errorf("summary prompts = %q, want the custom update and turn prefix prompts", prompts)
+	}
+	if want := []string{"custom system", "custom system"}; !reflect.DeepEqual(systemPrompts, want) {
+		t.Errorf("system prompts = %q, want %q", systemPrompts, want)
+	}
+}
+
 func registerSummaryTestProvider(
 	t *testing.T,
 	reasoning bool,
@@ -2165,4 +2269,402 @@ func compactionFlowAssistantText(t *testing.T, message ai.AssistantMessage) stri
 		t.Fatalf("assistant content type = %T, want ai.TextContent", message.Content[0])
 	}
 	return content.Text
+}
+
+// ============================================================================
+// Compaction Hook Tests
+// ============================================================================
+
+// jsonCompactionSessionStore keeps compaction entries as JSON and decodes them
+// on load, as a database store would. Other entries are returned unchanged.
+type jsonCompactionSessionStore struct {
+	appendErrorSessionStore
+
+	mu      sync.Mutex
+	header  *SessionHeader
+	entries []SessionEntry
+	encoded map[string][]byte
+}
+
+func (s *jsonCompactionSessionStore) CreateSession(_ context.Context, header *SessionHeader) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.header = header
+	return nil
+}
+
+func (s *jsonCompactionSessionStore) AppendEntry(_ context.Context, _ *SessionHeader, entry SessionEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if compaction, ok := entry.(*CompactionEntry); ok {
+		encoded, err := json.Marshal(compaction)
+		if err != nil {
+			return err
+		}
+		if s.encoded == nil {
+			s.encoded = map[string][]byte{}
+		}
+		s.encoded[compaction.ID] = encoded
+	}
+	s.entries = append(s.entries, entry)
+	return nil
+}
+
+func (s *jsonCompactionSessionStore) LoadSession(context.Context, string) (*SessionHeader, []SessionEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries := make([]SessionEntry, len(s.entries))
+	for i, entry := range s.entries {
+		entries[i] = entry
+		if encoded, ok := s.encoded[entry.GetBase().ID]; ok {
+			var decoded CompactionEntry
+			if err := json.Unmarshal(encoded, &decoded); err != nil {
+				return nil, nil, err
+			}
+			entries[i] = &decoded
+		}
+	}
+	return s.header, entries, nil
+}
+
+type hookTestSummaryRequest struct {
+	systemPrompt string
+	prompt       string
+}
+
+// hookTestSession is a persistent session whose summary requests are recorded.
+type hookTestSession struct {
+	ctx     context.Context
+	model   ai.Model[ai.API]
+	store   *jsonCompactionSessionStore
+	session *AgentSession
+
+	mu       sync.Mutex
+	requests []hookTestSummaryRequest
+}
+
+func newHookTestSession(t *testing.T) *hookTestSession {
+	t.Helper()
+	h := &hookTestSession{ctx: context.Background(), store: &jsonCompactionSessionStore{}}
+	h.model = registerManualCompactionProviderWithStream(t, func(
+		_ ai.Model[ai.API],
+		modelContext ai.ModelContext,
+		_ *ai.SimpleStreamOptions,
+	) (*ai.AssistantMessageEventStream, error) {
+		request := hookTestSummaryRequest{}
+		if modelContext.SystemPrompt != nil {
+			request.systemPrompt = *modelContext.SystemPrompt
+		}
+		request.prompt = userText(t, modelContext.Messages[0])
+		h.mu.Lock()
+		h.requests = append(h.requests, request)
+		h.mu.Unlock()
+		return autoCompactionStream(manualCompactionAssistantMessage("default summary", h.model)), nil
+	})
+
+	sm, err := NewSessionManager(h.ctx, nil, nil, true, h.store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedManualCompactionHistory(t, h.ctx, sm, h.model)
+	h.session = h.newSession(t, sm)
+	return h
+}
+
+func (h *hookTestSession) newSession(t *testing.T, sm *SessionManager) *AgentSession {
+	t.Helper()
+	apiKey := "test-key"
+	a := agent.NewAgent(&agent.AgentOptions{
+		InitialState: &agent.InitialAgentState{
+			Model:    &h.model,
+			Messages: sm.BuildSessionContext().Messages,
+		},
+		GetAPIKey: func(string) *string { return &apiKey },
+	})
+	session := NewAgentSession(a, sm)
+	session.SetCompactionSettings(CompactionSettings{Enabled: true, ReservedTokens: 100, KeepRecentTokens: 2})
+	return session
+}
+
+func (h *hookTestSession) summaryRequests() []hookTestSummaryRequest {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]hookTestSummaryRequest(nil), h.requests...)
+}
+
+// assertNothingCompacted checks that no compaction was saved and that the live
+// context still matches the session.
+func (h *hookTestSession) assertNothingCompacted(t *testing.T) {
+	t.Helper()
+	if latest := GetLatestCompactionEntry(h.session.SessionManager.GetEntries()); latest != nil {
+		t.Errorf("compaction entry was saved: %#v", latest)
+	}
+	for _, entry := range h.store.entries {
+		if _, ok := entry.(*CompactionEntry); ok {
+			t.Errorf("compaction entry was persisted: %#v", entry)
+		}
+	}
+	if got, want := h.session.Agent.State().Messages, h.session.SessionManager.BuildSessionContext().Messages; !reflect.DeepEqual(got, want) {
+		t.Errorf("live context differs from persisted context:\ngot  %#v\nwant %#v", got, want)
+	}
+	if got := len(h.session.Agent.State().Messages); got != 4 {
+		t.Errorf("live message count = %d, want the 4 uncompacted messages", got)
+	}
+}
+
+type hookTestFileOps struct {
+	Files []string `json:"files"`
+}
+
+func TestAgentSessionCompactionHookAugmentsDefaultAndDetailsSurviveReload(t *testing.T) {
+	h := newHookTestSession(t)
+	var mu sync.Mutex
+	var previous []hookTestFileOps
+	var reasons []CompactionReason
+	fileOpsHook := func(file string) CompactionHook {
+		return func(ctx context.Context, req CompactionRequest, next CompactFunc) (*CompactionResult, error) {
+			ops, ok, err := DecodeCompactionDetails[hookTestFileOps](req.Preparation.PreviousDetails)
+			if err != nil {
+				return nil, err
+			}
+			mu.Lock()
+			reasons = append(reasons, req.Reason)
+			if ok {
+				previous = append(previous, ops)
+			}
+			mu.Unlock()
+			ops.Files = append(ops.Files, file)
+
+			req.Prompts.Initial = "custom initial prompt"
+			result, err := next(ctx, req)
+			if err != nil {
+				return nil, err
+			}
+			result.Summary += "\nfiles: " + strings.Join(ops.Files, ", ")
+			result.Details = ops
+			return result, nil
+		}
+	}
+	h.session.SetCompactionHook(fileOpsHook("a.go"))
+
+	result, err := h.session.Compact(h.ctx, &ManualCompactionOptions{CustomInstructions: "focus on files"})
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+	if want := "default summary\nfiles: a.go"; result.Summary != want {
+		t.Errorf("summary = %q, want %q", result.Summary, want)
+	}
+	requests := h.summaryRequests()
+	if len(requests) != 1 {
+		t.Fatalf("summary requests = %d, want 1", len(requests))
+	}
+	// Unchanged prompts keep their defaults; changed ones reach the model.
+	if requests[0].systemPrompt != SUMMARIZATION_SYSTEM_PROMPT {
+		t.Errorf("summary system prompt = %q, want the default", requests[0].systemPrompt)
+	}
+	if want := "custom initial prompt\n\nAdditional focus: focus on files"; !strings.HasSuffix(requests[0].prompt, want) {
+		t.Errorf("summary prompt = %q, want suffix %q", requests[0].prompt, want)
+	}
+
+	latest := GetLatestCompactionEntry(h.session.SessionManager.GetEntries())
+	if latest == nil || latest.Summary != result.Summary {
+		t.Fatalf("saved compaction = %#v, want summary %q", latest, result.Summary)
+	}
+	if latest.FromHook != nil {
+		t.Errorf("fromHook = %v, want unset when the hook used the default summary", *latest.FromHook)
+	}
+	if got := h.session.Agent.State().Messages[0].(CompactionSummaryMessage); !strings.Contains(got.Summary, "files: a.go") {
+		t.Errorf("live summary = %q, want the hook's summary", got.Summary)
+	}
+
+	// The next compaction sees the same details whether or not the session was
+	// reloaded, even though a reload decodes them as map[string]any.
+	settings := h.session.GetCompactionSettings()
+	sessionID := h.session.SessionManager.GetSessionID()
+	sm, err := NewSessionManager(h.ctx, nil, &sessionID, true, h.store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sm := range []*SessionManager{h.session.SessionManager, sm} {
+		for _, message := range []agent.AgentMessage{
+			manualCompactionUserMessage("eeee"),
+			manualCompactionAssistantMessage("ffff", h.model),
+		} {
+			if _, err := sm.AppendMessage(h.ctx, message); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	live := PrepareCompaction(h.session.SessionManager.GetBranch(), settings)
+	reloaded := PrepareCompaction(sm.GetBranch(), settings)
+	if live == nil || reloaded == nil {
+		t.Fatal("second compaction has nothing to compact")
+	}
+	if _, ok := GetLatestCompactionEntry(sm.GetEntries()).Details.(map[string]any); !ok {
+		t.Fatalf("reloaded details = %T, want map[string]any from JSON", GetLatestCompactionEntry(sm.GetEntries()).Details)
+	}
+	if string(live.PreviousDetails) != string(reloaded.PreviousDetails) {
+		t.Errorf("previous details before reload = %s, after reload = %s", live.PreviousDetails, reloaded.PreviousDetails)
+	}
+
+	reloadedSession := h.newSession(t, sm)
+	reloadedSession.SetCompactionHook(fileOpsHook("b.go"))
+	result, err = reloadedSession.Compact(h.ctx, nil)
+	if err != nil {
+		t.Fatalf("Compact() after reload error = %v", err)
+	}
+	if want := "default summary\nfiles: a.go, b.go"; result.Summary != want {
+		t.Errorf("summary after reload = %q, want %q", result.Summary, want)
+	}
+	if want := []hookTestFileOps{{Files: []string{"a.go"}}}; !reflect.DeepEqual(previous, want) {
+		t.Errorf("previous details seen by hook = %#v, want %#v", previous, want)
+	}
+	if want := []CompactionReason{CompactionReasonManual, CompactionReasonManual}; !reflect.DeepEqual(reasons, want) {
+		t.Errorf("hook reasons = %v, want %v", reasons, want)
+	}
+	requests = h.summaryRequests()
+	if len(requests) != 2 || !strings.Contains(requests[1].prompt, "<previous-summary>\ndefault summary\nfiles: a.go\n</previous-summary>") {
+		t.Errorf("second summary request = %#v, want the hook's previous summary", requests)
+	}
+}
+
+func TestAgentSessionCompactionHookReplacesSummary(t *testing.T) {
+	h := newHookTestSession(t)
+	var branchEntries int
+	h.session.SetCompactionHook(func(_ context.Context, req CompactionRequest, _ CompactFunc) (*CompactionResult, error) {
+		branchEntries = len(req.BranchEntries)
+		return &CompactionResult{
+			Summary:          "custom summary",
+			FirstKeptEntryID: req.Preparation.FirstKeptEntryID,
+			TokensBefore:     req.Preparation.TokensBefore,
+			Details:          map[string]any{"source": "hook"},
+		}, nil
+	})
+
+	result, err := h.session.Compact(h.ctx, nil)
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+	if result.Summary != "custom summary" {
+		t.Errorf("summary = %q, want the hook's summary", result.Summary)
+	}
+	if got := len(h.summaryRequests()); got != 0 {
+		t.Errorf("summary requests = %d, want 0 when the hook replaces the summary", got)
+	}
+	if branchEntries != 4 {
+		t.Errorf("hook saw %d branch entries, want 4", branchEntries)
+	}
+
+	latest := GetLatestCompactionEntry(h.session.SessionManager.GetEntries())
+	if latest == nil || latest.Summary != "custom summary" {
+		t.Fatalf("saved compaction = %#v, want the hook's summary", latest)
+	}
+	if latest.FromHook == nil || !*latest.FromHook {
+		t.Errorf("fromHook = %v, want true", latest.FromHook)
+	}
+	if got := string(latest.Details.(json.RawMessage)); got != `{"source":"hook"}` {
+		t.Errorf("saved details = %s, want the hook's details", got)
+	}
+	if got := h.session.Agent.State().Messages[0].(CompactionSummaryMessage); got.Summary != "custom summary" {
+		t.Errorf("live summary = %q, want the hook's summary", got.Summary)
+	}
+}
+
+func TestAgentSessionCompactionHookCancelsManualCompaction(t *testing.T) {
+	h := newHookTestSession(t)
+	h.session.SetCompactionHook(func(context.Context, CompactionRequest, CompactFunc) (*CompactionResult, error) {
+		return nil, ErrCompactionCancelled
+	})
+	var ends []CompactionEndEvent
+	unsubscribe := h.session.Subscribe(func(event AgentSessionEvent) {
+		if end, ok := event.(CompactionEndEvent); ok {
+			ends = append(ends, end)
+		}
+	})
+	defer unsubscribe()
+
+	if _, err := h.session.Compact(h.ctx, nil); !errors.Is(err, ErrCompactionCancelled) {
+		t.Fatalf("Compact() error = %v, want ErrCompactionCancelled", err)
+	}
+	if len(ends) != 1 || !ends[0].Aborted || ends[0].ErrorMessage != "" || ends[0].Result != nil {
+		t.Errorf("compaction_end events = %#v, want one aborted event without an error message", ends)
+	}
+	if got := len(h.summaryRequests()); got != 0 {
+		t.Errorf("summary requests = %d, want 0", got)
+	}
+	h.assertNothingCompacted(t)
+}
+
+func TestAgentSessionCompactionHookCancelsAutomaticCompactionBeforePrompt(t *testing.T) {
+	h := newAutoCompactionHarness(t, false)
+	var reason atomic.Value
+	h.session.SetCompactionHook(func(_ context.Context, req CompactionRequest, _ CompactFunc) (*CompactionResult, error) {
+		reason.Store(req.Reason)
+		return nil, ErrCompactionCancelled
+	})
+	h.appendMessages(t, manualCompactionUserMessage("big"), h.response(950, ai.StopReasonStop))
+	h.responses = []ai.AssistantMessage{h.response(40, ai.StopReasonStop)}
+	log, unsubscribe := recordSessionEvents(h)
+	defer unsubscribe()
+
+	if err := h.session.Prompt(h.ctx, "next", nil); err != nil {
+		t.Fatalf("Prompt error = %v, want nil after the hook cancelled compaction", err)
+	}
+	end := assertPromptSentAfterFailedCompaction(t, h, log, "next", true)
+	if end.ErrorMessage != "" {
+		t.Errorf("cancelled compaction_end errorMessage = %q, want empty", end.ErrorMessage)
+	}
+	if got := reason.Load(); got != CompactionReasonThreshold {
+		t.Errorf("hook reason = %v, want %v", got, CompactionReasonThreshold)
+	}
+	if got := h.summaryCalls.Load(); got != 0 {
+		t.Errorf("summary requests = %d, want 0", got)
+	}
+}
+
+func TestAgentSessionCompactionHookRejectsInvalidResults(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		result func(req CompactionRequest) *CompactionResult
+		want   string
+	}{
+		{
+			name: "unknown first kept entry",
+			result: func(req CompactionRequest) *CompactionResult {
+				return &CompactionResult{Summary: "custom", FirstKeptEntryID: "missing"}
+			},
+			want: `first kept entry "missing" is not on the current branch`,
+		},
+		{
+			name: "empty first kept entry",
+			result: func(req CompactionRequest) *CompactionResult {
+				return &CompactionResult{Summary: "custom"}
+			},
+			want: `first kept entry "" is not on the current branch`,
+		},
+		{
+			name: "details that do not marshal",
+			result: func(req CompactionRequest) *CompactionResult {
+				return &CompactionResult{Summary: "custom", FirstKeptEntryID: req.Preparation.FirstKeptEntryID, Details: make(chan int)}
+			},
+			want: "compaction details:",
+		},
+		{
+			name:   "no result",
+			result: func(CompactionRequest) *CompactionResult { return nil },
+			want:   "compaction hook returned no result",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHookTestSession(t)
+			h.session.SetCompactionHook(func(_ context.Context, req CompactionRequest, _ CompactFunc) (*CompactionResult, error) {
+				return test.result(req), nil
+			})
+
+			if _, err := h.session.Compact(h.ctx, nil); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Compact() error = %v, want %q", err, test.want)
+			}
+			h.assertNothingCompacted(t)
+		})
+	}
 }

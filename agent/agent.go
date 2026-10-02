@@ -211,6 +211,16 @@ func (q *PendingMessageQueue) Drain() []AgentMessage {
 	return []AgentMessage{first}
 }
 
+// TakeAll removes and returns every queued message, regardless of mode.
+func (q *PendingMessageQueue) TakeAll() []AgentMessage {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	taken := q.messages
+	q.messages = []AgentMessage{}
+	return taken
+}
+
 func (q *PendingMessageQueue) Clear() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -412,6 +422,12 @@ func (a *Agent) ClearFollowUpQueue() {
 func (a *Agent) ClearAllQueues() {
 	a.ClearSteeringQueue()
 	a.ClearFollowUpQueue()
+}
+
+// TakeQueuedMessages removes and returns every queued message, steering
+// messages first, so a caller can deliver them some other way.
+func (a *Agent) TakeQueuedMessages() []AgentMessage {
+	return append(a.steeringQueue.TakeAll(), a.followUpQueue.TakeAll()...)
 }
 
 func (a *Agent) HasQueuedMessages() bool {

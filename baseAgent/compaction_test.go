@@ -337,6 +337,139 @@ func TestCompactGeneratesSplitTurnSummariesInParallel(t *testing.T) {
 	}
 }
 
+func TestCompactSplitTurnWithoutNewHistory(t *testing.T) {
+	tests := []struct {
+		name            string
+		previousSummary *string
+		wantHistory     string
+	}{
+		{
+			// Only the latest compaction is kept in context, so the new summary
+			// must carry the previous one forward.
+			name:            "keeps the previous summary",
+			previousSummary: func() *string { s := "previous summary"; return &s }(),
+			wantHistory:     "previous summary",
+		},
+		{
+			name:        "notes missing history",
+			wantHistory: "No prior history.",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int32
+			model := registerSummaryTestProvider(t, false, func(
+				ai.Model[ai.API],
+				ai.ModelContext,
+				*ai.SimpleStreamOptions,
+			) (*ai.AssistantMessageEventStream, error) {
+				requests.Add(1)
+				return completedSummaryTestStream(summaryTestTextMessage("turn prefix summary")), nil
+			})
+			preparation := &CompactionPreparation{
+				FirstKeptEntryID: "kept-entry",
+				TurnPrefixMessages: []agent.AgentMessage{
+					testUserMessage("prefix"),
+				},
+				IsSplitTurn:     true,
+				PreviousSummary: test.previousSummary,
+				Settings:        CompactionSettings{ReservedTokens: 100},
+			}
+
+			result, err := Compact(context.Background(), preparation, model, "test-key", nil)
+			if err != nil {
+				t.Fatalf("Compact() error = %v", err)
+			}
+			want := test.wantHistory + "\n\n---\n\n**Turn Context (split turn):**\n\nturn prefix summary"
+			if result.Summary != want {
+				t.Fatalf("Compact() summary = %q, want %q", result.Summary, want)
+			}
+			if got := requests.Load(); got != 1 {
+				t.Fatalf("summary requests = %d, want only the turn prefix request", got)
+			}
+		})
+	}
+}
+
+func TestCompactSplitTurnRejectsTruncatedTurnPrefixSummary(t *testing.T) {
+	model := registerSummaryTestProvider(t, false, func(
+		_ ai.Model[ai.API],
+		modelContext ai.ModelContext,
+		_ *ai.SimpleStreamOptions,
+	) (*ai.AssistantMessageEventStream, error) {
+		response := summaryTestTextMessage("history summary")
+		// Both requests run concurrently, so inspect the prompt without t.Fatal.
+		prompt := ""
+		if message, ok := modelContext.Messages[0].(ai.UserMessage); ok && len(message.Content) == 1 {
+			if text, ok := message.Content[0].(ai.TextContent); ok {
+				prompt = text.Text
+			}
+		}
+		if strings.Contains(prompt, TURN_PREFIX_SUMMARIZATION_PROMPT) {
+			response = summaryTestTextMessage("partial turn prefix")
+			response.StopReason = ai.StopReasonLength
+		}
+		return completedSummaryTestStream(response), nil
+	})
+	preparation := &CompactionPreparation{
+		FirstKeptEntryID:    "kept-entry",
+		MessagesToSummarize: []agent.AgentMessage{testUserMessage("history")},
+		TurnPrefixMessages:  []agent.AgentMessage{testUserMessage("prefix")},
+		IsSplitTurn:         true,
+		Settings:            CompactionSettings{ReservedTokens: 100},
+	}
+
+	_, err := Compact(context.Background(), preparation, model, "test-key", nil)
+	want := "turn prefix summarization failed: summary was truncated at the output token limit"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Compact() error = %v, want %q", err, want)
+	}
+}
+
+func TestCompactSplitTurnFailureCancelsOtherSummary(t *testing.T) {
+	historyCancelled := make(chan struct{})
+	model := registerSummaryTestProvider(t, false, func(
+		_ ai.Model[ai.API],
+		modelContext ai.ModelContext,
+		options *ai.SimpleStreamOptions,
+	) (*ai.AssistantMessageEventStream, error) {
+		prompt := ""
+		if message, ok := modelContext.Messages[0].(ai.UserMessage); ok && len(message.Content) == 1 {
+			if text, ok := message.Content[0].(ai.TextContent); ok {
+				prompt = text.Text
+			}
+		}
+		if strings.Contains(prompt, TURN_PREFIX_SUMMARIZATION_PROMPT) {
+			return nil, errors.New("turn prefix failed")
+		}
+		select {
+		case <-options.Signal.Done():
+			close(historyCancelled)
+			return nil, options.Signal.Err()
+		case <-time.After(5 * time.Second):
+			return completedSummaryTestStream(summaryTestTextMessage("history summary")), nil
+		}
+	})
+	preparation := &CompactionPreparation{
+		FirstKeptEntryID:    "kept-entry",
+		MessagesToSummarize: []agent.AgentMessage{testUserMessage("history")},
+		TurnPrefixMessages:  []agent.AgentMessage{testUserMessage("prefix")},
+		IsSplitTurn:         true,
+		Settings:            CompactionSettings{ReservedTokens: 100},
+	}
+
+	_, err := Compact(context.Background(), preparation, model, "test-key", nil)
+	if err == nil || err.Error() != "turn prefix summarization failed: turn prefix failed" {
+		t.Fatalf("Compact() error = %v, want the turn prefix failure", err)
+	}
+	select {
+	case <-historyCancelled:
+	default:
+		t.Fatal("history summary request was not cancelled")
+	}
+}
+
 // ============================================================================
 // Token Calculation
 // ============================================================================
@@ -511,6 +644,18 @@ func TestShouldTriggerCompaction(t *testing.T) {
 			contextWindow: 100_000,
 			settings:      CompactionSettings{Enabled: false, ReservedTokens: 10_000},
 		},
+		{
+			name:          "does not trigger for an unknown context window",
+			contextTokens: 1,
+			contextWindow: 0,
+			settings:      CompactionSettings{Enabled: true, ReservedTokens: 10_000},
+		},
+		{
+			name:          "does not trigger for a negative context window",
+			contextTokens: 1,
+			contextWindow: -1,
+			settings:      CompactionSettings{Enabled: true, ReservedTokens: 10_000},
+		},
 	}
 
 	for _, test := range tests {
@@ -541,13 +686,14 @@ func TestEstimateTokens(t *testing.T) {
 			want: 2,
 		},
 		{
-			name: "user image does not add tokens",
+			name: "user image counts as 4800 characters",
 			message: ai.UserMessage{
 				Role: ai.RoleUser,
 				Content: []ai.UserContent{
 					ai.ImageContent{Type: ai.ContentTypeImage, Image: "image-data", MimeType: "image/png"},
 				},
 			},
+			want: 1200,
 		},
 		{
 			name: "assistant text blocks",
@@ -584,6 +730,22 @@ func TestEstimateTokens(t *testing.T) {
 				},
 			},
 			want: 3,
+		},
+		{
+			// "run" + {"cmd":"a<b&c"}: 18 characters, not the 28 with HTML escaping.
+			name: "assistant tool call arguments without HTML escaping",
+			message: ai.AssistantMessage{
+				Role: ai.RoleAssistant,
+				Content: []ai.AssistantContent{
+					ai.ToolCall{
+						Type: ai.ContentTypeToolCall,
+						Id:   "call-id",
+						Name: "run",
+						Args: map[string]any{"cmd": "a<b&c"},
+					},
+				},
+			},
+			want: 5,
 		},
 		{
 			name: "custom text",
@@ -1280,6 +1442,11 @@ func TestFormatToolArguments(t *testing.T) {
 			want: `options={"force":true,"retries":3}`,
 		},
 		{
+			name: "does not HTML-escape values",
+			args: map[string]any{"cmd": "a < b && c > d", "nested": map[string]any{"html": "<p>"}},
+			want: `cmd="a < b && c > d", nested={"html":"<p>"}`,
+		},
+		{
 			name: "normalizes an object to sorted arguments",
 			args: argumentObject{Z: "last", A: 1},
 			want: `a=1, z="last"`,
@@ -1389,18 +1556,9 @@ func TestPrepareCompactionTrivialCases(t *testing.T) {
 	})
 
 	t.Run("all messages fit", func(t *testing.T) {
-		message := testUserMessage("request")
-		entries := linkPreparationEntries(testMessageEntry("user", message))
-
-		got := PrepareCompaction(entries, settings)
-		if got == nil {
-			t.Fatalf("PrepareCompaction() = nil, want preparation")
-		}
-		if got.FirstKeptEntryID != "user" {
-			t.Errorf("FirstKeptEntryID = %q, want %q", got.FirstKeptEntryID, "user")
-		}
-		if len(got.MessagesToSummarize) != 0 || len(got.TurnPrefixMessages) != 0 {
-			t.Errorf("unexpected summary messages: %#v %#v", got.MessagesToSummarize, got.TurnPrefixMessages)
+		entries := linkPreparationEntries(testMessageEntry("user", testUserMessage("request")))
+		if got := PrepareCompaction(entries, settings); got != nil {
+			t.Fatalf("PrepareCompaction() = %#v, want nil", got)
 		}
 	})
 }
@@ -1501,7 +1659,7 @@ func TestPrepareCompactionForSplitTurn(t *testing.T) {
 	}
 }
 
-func TestPrepareCompactionPreservesPreviouslyKeptMessages(t *testing.T) {
+func TestPrepareCompactionSkipsWhenPreviouslyKeptMessagesFit(t *testing.T) {
 	userOne := testUserMessage("user msg 1")
 	assistantOne := preparationAssistantMessage("assistant msg 1", 100)
 	userTwo := testUserMessage("user msg 2 - kept by compaction1")
@@ -1528,40 +1686,11 @@ func TestPrepareCompactionPreservesPreviouslyKeptMessages(t *testing.T) {
 	)
 	settings := CompactionSettings{Enabled: true, ReservedTokens: 500, KeepRecentTokens: 20_000}
 
-	got := PrepareCompaction(entries, settings)
-	if got == nil {
-		t.Fatalf("PrepareCompaction() = nil, want preparation")
-	}
-	if got.FirstKeptEntryID != "user-2" {
-		t.Errorf("FirstKeptEntryID = %q, want %q", got.FirstKeptEntryID, "user-2")
-	}
-	if got.PreviousSummary == nil || *got.PreviousSummary != "First summary" {
-		t.Errorf("PreviousSummary = %v, want %q", got.PreviousSummary, "First summary")
-	}
-	if len(got.MessagesToSummarize) != 0 || len(got.TurnPrefixMessages) != 0 {
-		t.Errorf("unexpected summary messages: %#v %#v", got.MessagesToSummarize, got.TurnPrefixMessages)
-	}
-	if got.TokensBefore != 10_000 {
-		t.Errorf("TokensBefore = %d, want 10000", got.TokensBefore)
-	}
-
-	parentID := entries[len(entries)-1].GetBase().ID
-	secondCompaction := &CompactionEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:     "compaction",
-			ID:       "compaction-2",
-			ParentID: &parentID,
-		},
-		Summary:          "Second summary",
-		FirstKeptEntryID: got.FirstKeptEntryID,
-		TokensBefore:     got.TokensBefore,
-	}
-	contextAfter := BuildSessionContext(append(entries, secondCompaction), nil, nil)
-	if !preparationMessagesContainText(contextAfter.Messages, "user msg 2 - kept by compaction1") {
-		t.Errorf("context does not contain the second user message")
-	}
-	if !preparationMessagesContainText(contextAfter.Messages, "user msg 3 - kept by compaction1") {
-		t.Errorf("context does not contain the third user message")
+	// Messages kept by the previous compaction and everything after it fit in
+	// KeepRecentTokens. A second compaction would summarize nothing and replace
+	// the first summary with a copy of itself.
+	if got := PrepareCompaction(entries, settings); got != nil {
+		t.Fatalf("PrepareCompaction() = %#v, want nil", got)
 	}
 }
 
@@ -1772,7 +1901,7 @@ func TestGenerateSummaryBuildsUpdateRequest(t *testing.T) {
 		options *ai.SimpleStreamOptions,
 	) (*ai.AssistantMessageEventStream, error) {
 		request = summaryTestRequest{modelContext: modelContext, options: *options}
-		return completedSummaryTestStream(ai.AssistantMessage{StopReason: ai.StopReasonStop}), nil
+		return completedSummaryTestStream(summaryTestTextMessage("summary")), nil
 	})
 
 	_, err := GenerateSummary(
@@ -1842,7 +1971,7 @@ func TestGenerateSummaryReasoningOptions(t *testing.T) {
 					hasReasoning = true
 					gotReasoning = *options.Reasoning
 				}
-				return completedSummaryTestStream(ai.AssistantMessage{StopReason: ai.StopReasonStop}), nil
+				return completedSummaryTestStream(summaryTestTextMessage("summary")), nil
 			})
 
 			_, err := GenerateSummary(
@@ -1923,6 +2052,69 @@ func TestGenerateSummaryErrors(t *testing.T) {
 	}
 }
 
+// A summary replaces the history it covers, so a partial or empty response
+// must fail compaction rather than be persisted.
+func TestGenerateSummaryRejectsUnusableResponses(t *testing.T) {
+	text := []ai.AssistantContent{ai.TextContent{Type: ai.ContentTypeText, Text: "partial summary"}}
+	tests := []struct {
+		name     string
+		response ai.AssistantMessage
+		want     string
+	}{
+		{
+			name:     "truncated at the output limit",
+			response: ai.AssistantMessage{Content: text, StopReason: ai.StopReasonLength},
+			want:     "summarization failed: summary was truncated at the output token limit",
+		},
+		{
+			name:     "aborted",
+			response: ai.AssistantMessage{Content: text, StopReason: ai.StopReasonAborted},
+			want:     "summarization failed: response was aborted",
+		},
+		{
+			name:     "no content",
+			response: ai.AssistantMessage{StopReason: ai.StopReasonStop},
+			want:     "summarization failed: summary is empty",
+		},
+		{
+			name: "whitespace text",
+			response: ai.AssistantMessage{
+				Content:    []ai.AssistantContent{ai.TextContent{Type: ai.ContentTypeText, Text: " \n\t"}},
+				StopReason: ai.StopReasonStop,
+			},
+			want: "summarization failed: summary is empty",
+		},
+		{
+			name: "no text content",
+			response: ai.AssistantMessage{
+				Content: []ai.AssistantContent{
+					ai.ThinkingContent{Type: ai.ContentTypeThinking, Thinking: "private reasoning"},
+					ai.ToolCall{Type: ai.ContentTypeToolCall, Id: "call-id", Name: "tool", Args: map[string]any{}},
+				},
+				StopReason: ai.StopReasonStop,
+			},
+			want: "summarization failed: summary is empty",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			model := registerSummaryTestProvider(t, false, func(
+				ai.Model[ai.API],
+				ai.ModelContext,
+				*ai.SimpleStreamOptions,
+			) (*ai.AssistantMessageEventStream, error) {
+				return completedSummaryTestStream(test.response), nil
+			})
+
+			_, err := GenerateSummary(context.Background(), nil, model, 100, "test-key", nil)
+			if err == nil || err.Error() != test.want {
+				t.Fatalf("GenerateSummary() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestGenerateSummaryReturnsOnlyTextContent(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1938,13 +2130,6 @@ func TestGenerateSummaryReturnsOnlyTextContent(t *testing.T) {
 				ai.TextContent{Type: ai.ContentTypeText, Text: "second"},
 			},
 			want: "first\nsecond",
-		},
-		{
-			name: "returns empty text without text content",
-			content: []ai.AssistantContent{
-				ai.ThinkingContent{Type: ai.ContentTypeThinking, Thinking: "private reasoning"},
-				ai.ToolCall{Type: ai.ContentTypeToolCall, Id: "call-id", Name: "tool", Args: map[string]any{}},
-			},
 		},
 	}
 
@@ -2056,6 +2241,14 @@ func completedSummaryTestStream(message ai.AssistantMessage) *ai.AssistantMessag
 	stream := ai.NewAssistantMessageEventStream(1)
 	stream.Push(ai.DoneEvent{Type: "done", Message: message})
 	return stream
+}
+
+func summaryTestTextMessage(text string) ai.AssistantMessage {
+	return ai.AssistantMessage{
+		Role:       ai.RoleAssistant,
+		Content:    []ai.AssistantContent{ai.TextContent{Type: ai.ContentTypeText, Text: text}},
+		StopReason: ai.StopReasonStop,
+	}
 }
 
 func summaryTestPrompt(t *testing.T, modelContext ai.ModelContext) string {
@@ -2284,6 +2477,9 @@ type jsonCompactionSessionStore struct {
 	header  *SessionHeader
 	entries []SessionEntry
 	encoded map[string][]byte
+
+	// onAppendCompaction runs before a compaction entry is stored.
+	onAppendCompaction func(ctx context.Context)
 }
 
 func (s *jsonCompactionSessionStore) CreateSession(_ context.Context, header *SessionHeader) error {
@@ -2293,10 +2489,13 @@ func (s *jsonCompactionSessionStore) CreateSession(_ context.Context, header *Se
 	return nil
 }
 
-func (s *jsonCompactionSessionStore) AppendEntry(_ context.Context, _ *SessionHeader, entry SessionEntry) error {
+func (s *jsonCompactionSessionStore) AppendEntry(ctx context.Context, _ *SessionHeader, entry SessionEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if compaction, ok := entry.(*CompactionEntry); ok {
+		if s.onAppendCompaction != nil {
+			s.onAppendCompaction(ctx)
+		}
 		encoded, err := json.Marshal(compaction)
 		if err != nil {
 			return err
@@ -2593,6 +2792,94 @@ func TestAgentSessionCompactionHookCancelsManualCompaction(t *testing.T) {
 		t.Errorf("summary requests = %d, want 0", got)
 	}
 	h.assertNothingCompacted(t)
+}
+
+// Once the summary is complete, cancelling compaction must not interrupt the
+// write, but a stuck store must still fail.
+func TestAgentSessionCompactionPersistsDespiteCancellationDuringWrite(t *testing.T) {
+	h := newHookTestSession(t)
+	var writeErr error
+	var hasDeadline bool
+	h.store.onAppendCompaction = func(ctx context.Context) {
+		h.session.AbortCompaction()
+		writeErr = ctx.Err()
+		_, hasDeadline = ctx.Deadline()
+	}
+
+	result, err := h.session.Compact(h.ctx, nil)
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+	if writeErr != nil {
+		t.Errorf("write context error = %v, want a write unaffected by AbortCompaction", writeErr)
+	}
+	if !hasDeadline {
+		t.Error("write context has no deadline")
+	}
+	latest := GetLatestCompactionEntry(h.session.SessionManager.GetEntries())
+	if latest == nil || latest.Summary != result.Summary {
+		t.Fatalf("latest compaction = %#v, want the returned result", latest)
+	}
+	if got, want := h.session.Agent.State().Messages, h.session.SessionManager.BuildSessionContext().Messages; !reflect.DeepEqual(got, want) {
+		t.Errorf("live context differs from persisted context:\ngot  %#v\nwant %#v", got, want)
+	}
+}
+
+func TestAgentSessionCompactionTimeoutIsFailure(t *testing.T) {
+	h := newHookTestSession(t)
+	h.session.SetCompactionHook(func(ctx context.Context, _ CompactionRequest, _ CompactFunc) (*CompactionResult, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	var ends []CompactionEndEvent
+	unsubscribe := h.session.Subscribe(func(event AgentSessionEvent) {
+		if end, ok := event.(CompactionEndEvent); ok {
+			ends = append(ends, end)
+		}
+	})
+	defer unsubscribe()
+
+	ctx, cancel := context.WithTimeout(h.ctx, 10*time.Millisecond)
+	defer cancel()
+	_, err := h.session.Compact(ctx, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Compact() error = %v, want context.DeadlineExceeded", err)
+	}
+	want := "Compaction failed: compaction timed out: context deadline exceeded"
+	if len(ends) != 1 || ends[0].Aborted || ends[0].ErrorMessage != want {
+		t.Errorf("compaction_end events = %#v, want one failure %q", ends, want)
+	}
+	h.assertNothingCompacted(t)
+}
+
+func TestIsCompactionAbort(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	live := context.Background()
+	failure := errors.New("provider failed")
+
+	tests := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{name: "cancelled compaction", ctx: cancelled, err: failure, want: true},
+		{name: "expired compaction", ctx: expired, err: context.DeadlineExceeded},
+		{name: "hook cancelled", ctx: live, err: fmt.Errorf("hook: %w", ErrCompactionCancelled), want: true},
+		{name: "cancelled request", ctx: live, err: fmt.Errorf("request: %w", context.Canceled), want: true},
+		{name: "request timeout", ctx: live, err: fmt.Errorf("request: %w", context.DeadlineExceeded)},
+		{name: "provider failure", ctx: live, err: failure},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isCompactionAbort(test.ctx, test.err); got != test.want {
+				t.Fatalf("isCompactionAbort() = %t, want %t", got, test.want)
+			}
+		})
+	}
 }
 
 func TestAgentSessionCompactionHookCancelsAutomaticCompactionBeforePrompt(t *testing.T) {

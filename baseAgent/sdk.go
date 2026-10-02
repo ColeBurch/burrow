@@ -90,6 +90,15 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 
 	existingSession := sessionManager.BuildSessionContext()
 	hasExistingSession := len(existingSession.Messages) > 0
+	// BuildSessionContext reports "off" when the branch has no thinking-level
+	// entry, so only trust its value when an entry actually exists.
+	hasThinkingEntry := false
+	for _, entry := range sessionManager.GetBranch() {
+		if _, ok := entry.(*ThinkingLevelChangeEntry); ok {
+			hasThinkingEntry = true
+			break
+		}
+	}
 
 	model := options.Model
 	var modelFallbackMessage *string
@@ -116,7 +125,7 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 
 	thinkingLevel := options.ThinkingLevel
 	if thinkingLevel == "" {
-		if hasExistingSession && existingSession.ThinkingLevel != "" {
+		if hasExistingSession && hasThinkingEntry {
 			thinkingLevel = ai.ModelThinkingLevel(existingSession.ThinkingLevel)
 		} else {
 			thinkingLevel = DefaultThinkingLevel

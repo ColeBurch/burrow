@@ -273,6 +273,27 @@ func TestAgentQueuesAndAbort(t *testing.T) {
 	}
 }
 
+func TestAgentTakeQueuedMessagesIgnoresQueueMode(t *testing.T) {
+	a := NewAgent(nil)
+	a.SetSteeringMode(QueueModeOneAtATime)
+	a.SetFollowUpMode(QueueModeOneAtATime)
+	steer1, steer2 := userMsg("steer 1"), userMsg("steer 2")
+	followUp1, followUp2 := userMsg("follow-up 1"), userMsg("follow-up 2")
+	a.FollowUp(followUp1)
+	a.Steer(steer1)
+	a.FollowUp(followUp2)
+	a.Steer(steer2)
+
+	got := a.TakeQueuedMessages()
+	want := []AgentMessage{steer1, steer2, followUp1, followUp2}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("TakeQueuedMessages() = %#v, want %#v", got, want)
+	}
+	if a.HasQueuedMessages() {
+		t.Fatal("queues are not empty after TakeQueuedMessages")
+	}
+}
+
 func TestAgentRejectsPromptAndContinueWhileStreaming(t *testing.T) {
 	a := NewAgent(&AgentOptions{StreamFn: func(ctx context.Context, _ ai.Model[ai.API], _ ai.ModelContext, _ *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
 		return neverEndingUntilAbortStream(ctx), nil

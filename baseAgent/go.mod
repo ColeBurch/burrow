@@ -6,6 +6,7 @@ require (
 	github.com/ColeBurch/burrow/agent v0.2.0
 	github.com/ColeBurch/burrow/ai v0.2.0
 	github.com/google/uuid v1.6.0
+	golang.org/x/sync v0.22.0
 )
 
 require (

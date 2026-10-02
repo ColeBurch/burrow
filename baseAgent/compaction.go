@@ -1,15 +1,17 @@
 package baseAgent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf16"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/ColeBurch/burrow/agent"
 	"github.com/ColeBurch/burrow/ai"
@@ -192,9 +194,10 @@ func EstimateContextTokens(messages []agent.AgentMessage) contextUsageEstimate {
 
 /**
  * Check if compaction should trigger based on context usage.
+ * An unknown (non-positive) context window never triggers.
  */
 func ShouldTriggerCompaction(contextTokens int64, contextWindow int64, settings CompactionSettings) bool {
-	if !settings.Enabled {
+	if !settings.Enabled || contextWindow <= 0 {
 		return false
 	}
 	return contextTokens > contextWindow-settings.ReservedTokens
@@ -211,6 +214,8 @@ func EstimateTokens(message agent.AgentMessage) int64 {
 			switch block := content.(type) {
 			case ai.TextContent:
 				chars += utf16Length(block.Text)
+			case ai.ImageContent:
+				chars += 4800
 			}
 		}
 
@@ -223,7 +228,7 @@ func EstimateTokens(message agent.AgentMessage) int64 {
 				chars += utf16Length(block.Thinking)
 			case ai.ToolCall:
 				chars += utf16Length(block.Name)
-				if args, err := json.Marshal(block.Args); err == nil {
+				if args, err := marshalJSON(block.Args); err == nil {
 					chars += utf16Length(string(args))
 				}
 			}
@@ -592,12 +597,30 @@ func GenerateSummary(
 	if err != nil {
 		return "", fmt.Errorf("summarization failed: %w", err)
 	}
-	if response.StopReason == ai.StopReasonError {
-		message := response.ErrorMessage
-		if message == "" {
-			message = "unknown error"
+	summary, err := summaryText(ctx, response)
+	if err != nil {
+		return "", fmt.Errorf("summarization failed: %w", err)
+	}
+	return summary, nil
+}
+
+// summaryText returns the text of a summarization response. A summary replaces
+// the history it covers, so failed, aborted, truncated, and empty responses are
+// errors rather than partial summaries.
+func summaryText(ctx context.Context, response ai.AssistantMessage) (string, error) {
+	switch response.StopReason {
+	case ai.StopReasonError:
+		if response.ErrorMessage == "" {
+			return "", errors.New("unknown error")
 		}
-		return "", fmt.Errorf("summarization failed: %s", message)
+		return "", errors.New(response.ErrorMessage)
+	case ai.StopReasonAborted:
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		return "", errors.New("response was aborted")
+	case ai.StopReasonLength:
+		return "", errors.New("summary was truncated at the output token limit")
 	}
 
 	textParts := make([]string, 0)
@@ -606,7 +629,11 @@ func GenerateSummary(
 			textParts = append(textParts, text.Text)
 		}
 	}
-	return strings.Join(textParts, "\n"), nil
+	summary := strings.Join(textParts, "\n")
+	if strings.TrimSpace(summary) == "" {
+		return "", errors.New("summary is empty")
+	}
+	return summary, nil
 }
 
 const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
@@ -685,7 +712,7 @@ func serializeConversation(messages []ai.Message) string {
 func formatToolArguments(args any) string {
 	values, ok := args.(map[string]any)
 	if !ok {
-		encoded, err := json.Marshal(args)
+		encoded, err := marshalJSON(args)
 		if err != nil || json.Unmarshal(encoded, &values) != nil {
 			return safeJSONString(args)
 		}
@@ -705,11 +732,24 @@ func formatToolArguments(args any) string {
 }
 
 func safeJSONString(value any) string {
-	encoded, err := json.Marshal(value)
+	encoded, err := marshalJSON(value)
 	if err != nil {
 		return "[unserializable]"
 	}
 	return string(encoded)
+}
+
+// marshalJSON encodes like JSON.stringify. json.Marshal escapes <, > and & as
+// \u003c, \u003e and \u0026, which inflates token estimates for code-heavy tool
+// arguments and garbles them in summarization prompts.
+func marshalJSON(value any) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
 }
 
 func truncateForSummary(text string, maxChars int64) string {
@@ -832,6 +872,12 @@ func PrepareCompaction(
 		}
 	}
 
+	// Everything since the last boundary fits in KeepRecentTokens. Compacting
+	// would add a summary without removing anything.
+	if len(messagesToSummarize) == 0 && len(turnPrefixMessages) == 0 {
+		return nil
+	}
+
 	return &CompactionPreparation{
 		FirstKeptEntryID:    firstKeptEntryID,
 		MessagesToSummarize: messagesToSummarize,
@@ -891,32 +937,37 @@ func Compact(
 
 	var summary string
 	if preparation.IsSplitTurn && len(preparation.TurnPrefixMessages) > 0 {
+		// With nothing new before the split turn, the previous summary is still
+		// the history. Only the latest compaction is kept in context, so dropping
+		// it here would lose everything it covers.
 		historySummary := "No prior history."
-		var historyErr error
+		if previousSummary != "" {
+			historySummary = previousSummary
+		}
 		var turnPrefixSummary string
-		var turnPrefixErr error
-		var waitGroup sync.WaitGroup
+		// Both summaries are required, so the first failure cancels the other
+		// request and is the error returned.
+		group, groupCtx := errgroup.WithContext(ctx)
 
 		if len(preparation.MessagesToSummarize) > 0 {
-			waitGroup.Add(1)
-			go func() {
-				defer waitGroup.Done()
-				historySummary, historyErr = GenerateSummary(
-					ctx,
+			group.Go(func() error {
+				var err error
+				historySummary, err = GenerateSummary(
+					groupCtx,
 					preparation.MessagesToSummarize,
 					model,
 					preparation.Settings.ReservedTokens,
 					apiKey,
 					generateOptions,
 				)
-			}()
+				return err
+			})
 		}
 
-		waitGroup.Add(1)
-		go func() {
-			defer waitGroup.Done()
-			turnPrefixSummary, turnPrefixErr = generateTurnPrefixSummary(
-				ctx,
+		group.Go(func() error {
+			var err error
+			turnPrefixSummary, err = generateTurnPrefixSummary(
+				groupCtx,
 				preparation.TurnPrefixMessages,
 				model,
 				preparation.Settings.ReservedTokens,
@@ -925,14 +976,11 @@ func Compact(
 				thinkingLevel,
 				prompts,
 			)
-		}()
+			return err
+		})
 
-		waitGroup.Wait()
-		if historyErr != nil {
-			return nil, historyErr
-		}
-		if turnPrefixErr != nil {
-			return nil, turnPrefixErr
+		if err := group.Wait(); err != nil {
+			return nil, err
 		}
 
 		summary = historySummary + "\n\n---\n\n**Turn Context (split turn):**\n\n" + turnPrefixSummary
@@ -1008,19 +1056,9 @@ func generateTurnPrefixSummary(
 	if err != nil {
 		return "", fmt.Errorf("turn prefix summarization failed: %w", err)
 	}
-	if response.StopReason == ai.StopReasonError {
-		message := response.ErrorMessage
-		if message == "" {
-			message = "unknown error"
-		}
-		return "", fmt.Errorf("turn prefix summarization failed: %s", message)
+	summary, err := summaryText(ctx, response)
+	if err != nil {
+		return "", fmt.Errorf("turn prefix summarization failed: %w", err)
 	}
-
-	textParts := make([]string, 0)
-	for _, content := range response.Content {
-		if text, ok := content.(ai.TextContent); ok {
-			textParts = append(textParts, text.Text)
-		}
-	}
-	return strings.Join(textParts, "\n"), nil
+	return summary, nil
 }

@@ -407,8 +407,8 @@ func TestAgentSessionManualCompactionRejectsEmptySession(t *testing.T) {
 	})
 	session := NewAgentSession(a, sm)
 
-	if _, err := session.Compact(ctx, nil); err == nil || !strings.Contains(err.Error(), "nothing to compact") {
-		t.Fatalf("compaction error = %v, want nothing to compact", err)
+	if _, err := session.Compact(ctx, nil); !errors.Is(err, ErrNothingToCompact) {
+		t.Fatalf("compaction error = %v, want ErrNothingToCompact", err)
 	}
 }
 
@@ -482,6 +482,92 @@ func TestAgentSessionManualCompactionAbortsActiveRun(t *testing.T) {
 	}
 	if live, want := a.State().Messages, sm.BuildSessionContext().Messages; !reflect.DeepEqual(live, want) {
 		t.Errorf("live context differs from persisted context:\ngot  %#v\nwant %#v", live, want)
+	}
+}
+
+// Messages queued for a run that Compact aborts are handed back instead of
+// being stranded in the agent's queue until some later prompt.
+func TestAgentSessionManualCompactionRestoresQueuedMessages(t *testing.T) {
+	ctx := context.Background()
+	model := registerManualCompactionProvider(t, "compacted active run")
+	sm, err := InMemorySessionManager(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := seedManualCompactionHistory(t, ctx, sm, model)
+
+	streamStarted := make(chan struct{})
+	var requests atomic.Int32
+	apiKey := "test-key"
+	a := agent.NewAgent(&agent.AgentOptions{
+		InitialState: &agent.InitialAgentState{Model: &model, Messages: messages},
+		GetAPIKey:    func(string) *string { return &apiKey },
+		StreamFn: func(runCtx context.Context, _ ai.Model[ai.API], _ ai.ModelContext, _ *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
+			if requests.Add(1) == 1 {
+				close(streamStarted)
+			}
+			stream := ai.NewAssistantMessageEventStream(2)
+			go func() {
+				stream.Push(ai.StartEvent{Type: "start", Partial: manualCompactionAssistantMessage("", model)})
+				<-runCtx.Done()
+				aborted := manualCompactionAssistantMessage("aborted response", model)
+				aborted.StopReason = ai.StopReasonAborted
+				aborted.ErrorMessage = "aborted"
+				stream.Push(ai.ErrorEvent{Type: "error", Reason: ai.StopReasonAborted, Message: aborted})
+			}()
+			return stream, nil
+		},
+	})
+	session := NewAgentSession(a, sm)
+	session.SetCompactionSettings(CompactionSettings{Enabled: true, ReservedTokens: 100, KeepRecentTokens: 2})
+	var ends []CompactionEndEvent
+	unsubscribe := session.Subscribe(func(event AgentSessionEvent) {
+		if end, ok := event.(CompactionEndEvent); ok {
+			ends = append(ends, end)
+		}
+	})
+	defer unsubscribe()
+
+	promptDone := make(chan error, 1)
+	go func() {
+		promptDone <- session.Prompt(ctx, "active prompt", nil)
+	}()
+	select {
+	case <-streamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("active agent run did not start")
+	}
+	if err := session.Prompt(ctx, "follow-up", &PromptOptions{StreamingBehavior: StreamingBehaviorFollowUp}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Prompt(ctx, "steer", &PromptOptions{StreamingBehavior: StreamingBehaviorSteer}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := session.Compact(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-promptDone:
+	case <-time.After(time.Second):
+		t.Fatal("aborted prompt did not finish")
+	}
+
+	if len(ends) != 1 {
+		t.Fatalf("compaction_end events = %d, want 1", len(ends))
+	}
+	var restored []string
+	for _, message := range ends[0].RestoredMessages {
+		restored = append(restored, userText(t, message))
+	}
+	if want := []string{"steer", "follow-up"}; !reflect.DeepEqual(restored, want) {
+		t.Errorf("restored messages = %q, want %q", restored, want)
+	}
+	if a.HasQueuedMessages() {
+		t.Error("restored messages are still queued")
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("agent requests = %d, want only the aborted run", got)
 	}
 }
 
@@ -927,6 +1013,33 @@ func TestAgentSessionAutoCompactionThreshold(t *testing.T) {
 	}
 }
 
+// A threshold crossing with everything inside KeepRecentTokens has nothing to
+// summarize. Like pi, it ends quietly instead of reporting a failure.
+func TestAgentSessionAutoCompactionThresholdWithNothingToCompact(t *testing.T) {
+	h := newAutoCompactionHarness(t, false)
+	settings := h.session.GetCompactionSettings()
+	settings.KeepRecentTokens = 1_000_000
+	h.session.SetCompactionSettings(settings)
+	log, unsubscribe := recordSessionEvents(h)
+	defer unsubscribe()
+	h.responses = []ai.AssistantMessage{h.response(901, ai.StopReasonStop)}
+
+	if err := h.session.Prompt(h.ctx, "next", nil); err != nil {
+		t.Fatal(err)
+	}
+	h.assertCounts(t, 0, 1)
+
+	observations := log.snapshot(true)
+	if got := sessionEventTypes(observations); !reflect.DeepEqual(got, []string{"compaction_start", "compaction_end"}) {
+		t.Fatalf("compaction events = %v, want start and end", got)
+	}
+	assertSessionEventStart(t, observations[0], CompactionReasonThreshold)
+	end := observations[1].event.(CompactionEndEvent)
+	if end.ErrorMessage != "" || end.Aborted || end.WillRetry || end.Result != nil {
+		t.Errorf("end event = %#v, want a silent no-op", end)
+	}
+}
+
 func TestAgentSessionAutoCompactionAbortedSkipsAgentEndButCompactsPrePrompt(t *testing.T) {
 	h := newAutoCompactionHarness(t, false)
 	h.responses = []ai.AssistantMessage{h.response(950, ai.StopReasonAborted), h.response(40, ai.StopReasonStop)}
@@ -1129,10 +1242,6 @@ func TestAgentSessionAutoCompactionManualCompactSuppressesAutomatic(t *testing.T
 	if !h.session.IsCompacting() || h.summaryCalls.Load() != 1 {
 		t.Fatal("expected only the blocked manual summary")
 	}
-	rejected := h.start(t, func(ctx context.Context) error { return h.session.Prompt(ctx, "during manual", nil) })
-	if err := rejected.wait(t); err == nil || !strings.Contains(err.Error(), "compaction in progress") {
-		t.Fatalf("Prompt during manual compaction = %v, want compaction in progress", err)
-	}
 	close(h.summaryRelease)
 	if err := manual.wait(t); err != nil {
 		t.Fatal(err)
@@ -1149,6 +1258,46 @@ func TestAgentSessionAutoCompactionManualCompactSuppressesAutomatic(t *testing.T
 	if got := countAbortedAssistants(persisted); got != 1 {
 		t.Errorf("persisted aborted responses = %d, want 1", got)
 	}
+}
+
+// A prompt sent during manual compaction neither fails nor joins the aborted
+// run's queue. It waits and then runs as a normal turn on the compacted context.
+func TestAgentSessionPromptWaitsForManualCompaction(t *testing.T) {
+	h := newAutoCompactionHarness(t, true)
+	h.responses = []ai.AssistantMessage{h.response(40, ai.StopReasonStop)}
+	manual := h.start(t, func(ctx context.Context) error {
+		_, err := h.session.Compact(ctx, nil)
+		return err
+	})
+	waitAutoCompactionSignal(t, h.summaryStarted)
+
+	waiting := h.start(t, func(ctx context.Context) error {
+		return h.session.Prompt(ctx, "during manual", &PromptOptions{StreamingBehavior: StreamingBehaviorFollowUp})
+	})
+	cancelled, cancel := context.WithCancel(h.ctx)
+	abandoned := h.start(t, func(context.Context) error { return h.session.Prompt(cancelled, "abandoned", nil) })
+	cancel()
+	if err := abandoned.wait(t); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Prompt cancelled while waiting = %v, want context.Canceled", err)
+	}
+	select {
+	case <-waiting.done:
+		t.Fatalf("Prompt finished during compaction: %v", waiting.err)
+	default:
+	}
+	if h.session.Agent.HasQueuedMessages() {
+		t.Fatal("prompt during manual compaction was queued on the agent")
+	}
+
+	close(h.summaryRelease)
+	if err := manual.wait(t); err != nil {
+		t.Fatal(err)
+	}
+	if err := waiting.wait(t); err != nil {
+		t.Fatal(err)
+	}
+	h.assertCounts(t, 1, 1)
+	assertAutoCompactedRequest(t, h.recordedRequests()[0], "during manual")
 }
 
 // failAutoCompactionSummaries makes every summary request fail, like a provider outage.

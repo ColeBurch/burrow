@@ -20,7 +20,8 @@ const (
 	StreamingBehaviorFollowUp StreamingBehavior = "followUp"
 )
 
-// messagePersistTimeout bounds each message write, independent of run cancellation.
+// messagePersistTimeout bounds each message and compaction write, independent
+// of run and compaction cancellation.
 var messagePersistTimeout = 5 * time.Second
 
 type PromptOptions struct {
@@ -75,6 +76,10 @@ type CompactionEndEvent struct {
 	// WillRetry refers to overflow recovery, not queued-message continuation.
 	WillRetry    bool   `json:"willRetry"`
 	ErrorMessage string `json:"errorMessage,omitempty"`
+	// RestoredMessages are steering and follow-up messages, steering first, that
+	// were queued for the run a manual compaction aborted. They are removed from
+	// the agent and will not be sent; resend them with Prompt to deliver them.
+	RestoredMessages []agent.AgentMessage `json:"restoredMessages,omitempty"`
 }
 
 func (CompactionEndEvent) EventType() string { return "compaction_end" }
@@ -111,6 +116,11 @@ type CompactionHook func(ctx context.Context, req CompactionRequest, next Compac
 // prompt continue.
 var ErrCompactionCancelled = errors.New("compaction cancelled")
 
+// ErrNothingToCompact is returned when everything since the last compaction
+// fits in KeepRecentTokens, so compacting would not shrink the context.
+// Threshold compaction treats it as a no-op rather than a failure.
+var ErrNothingToCompact = errors.New("nothing to compact")
+
 type AgentSession struct {
 	// Use Prompt for session orchestration. Direct Agent runs bypass automatic
 	// compaction; their persisted messages are checked on the next session prompt.
@@ -129,8 +139,11 @@ type AgentSession struct {
 	compactionSettings CompactionSettings
 	compactionHook     CompactionHook
 	compactionCancel   context.CancelFunc
-	unsubscribeAgent   func()
-	eventListeners     []*AgentSessionEventListener
+	// manualCompactionDone is closed when a pending or running manual Compact
+	// finishes, waking prompts that arrived during it.
+	manualCompactionDone chan struct{}
+	unsubscribeAgent     func()
+	eventListeners       []*AgentSessionEventListener
 }
 
 func NewAgentSession(a *agent.Agent, sm *SessionManager) *AgentSession {
@@ -358,6 +371,11 @@ func (s *AgentSession) GetSessionName() (*string, error) {
 // ============================================================================
 
 // Compact manually compacts the active session branch and replaces the agent context.
+//
+// An active run is aborted first. Messages queued for it with Steer or FollowUp
+// are not sent: they are removed and reported in the compaction_end event's
+// RestoredMessages. Prompts that arrive during compaction wait for it to finish
+// and then run on the compacted context.
 func (s *AgentSession) Compact(ctx context.Context, options *ManualCompactionOptions) (*CompactionResult, error) {
 	if s.Agent == nil {
 		return nil, errors.New("no agent set")
@@ -377,6 +395,8 @@ func (s *AgentSession) Compact(ctx context.Context, options *ManualCompactionOpt
 	}
 	compactionCtx, cancel := context.WithCancel(ctx)
 	s.compactionCancel = cancel
+	done := make(chan struct{})
+	s.manualCompactionDone = done
 	runCancel := s.runCancel
 	s.mu.Unlock()
 
@@ -385,21 +405,30 @@ func (s *AgentSession) Compact(ctx context.Context, options *ManualCompactionOpt
 	if runCancel != nil {
 		runCancel()
 	}
+	s.Agent.Abort()
+	s.operationMu.Lock()
+	// Clear the compaction before releasing operationMu, so a waiting prompt
+	// that takes it next does not see this compaction as still pending.
 	defer func() {
 		cancel()
 		s.mu.Lock()
 		s.compactionCancel = nil
+		s.manualCompactionDone = nil
+		close(done)
 		s.mu.Unlock()
+		s.operationMu.Unlock()
 	}()
-
-	s.Agent.Abort()
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
 	s.Agent.WaitForIdle()
+	// Prompts wait during compaction rather than queue, so nothing is added
+	// after this.
+	restored := s.Agent.TakeQueuedMessages()
 
 	s.emit(CompactionStartEvent{Type: "compaction_start", Reason: CompactionReasonManual})
 	result, err := s.compactContext(compactionCtx, CompactionReasonManual, options)
 	end := CompactionEndEvent{Type: "compaction_end", Reason: CompactionReasonManual, Result: result}
+	if len(restored) > 0 {
+		end.RestoredMessages = restored
+	}
 	if err != nil {
 		end.Aborted = isCompactionAbort(compactionCtx, err)
 		if !end.Aborted {
@@ -410,9 +439,14 @@ func (s *AgentSession) Compact(ctx context.Context, options *ManualCompactionOpt
 	return result, err
 }
 
+// isCompactionAbort reports whether a compaction error comes from cancellation
+// (AbortCompaction, a cancelled caller, or a hook cancelling). Deadlines are
+// timeouts, so they are reported as failures.
 func isCompactionAbort(compactionCtx context.Context, err error) bool {
-	return compactionCtx.Err() != nil || errors.Is(err, ErrCompactionCancelled) ||
-		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	if ctxErr := compactionCtx.Err(); ctxErr != nil {
+		return errors.Is(ctxErr, context.Canceled)
+	}
+	return errors.Is(err, ErrCompactionCancelled) || errors.Is(err, context.Canceled)
 }
 
 // compactContext requires operationMu and an idle agent.
@@ -438,7 +472,7 @@ func (s *AgentSession) compactContext(compactionCtx context.Context, reason Comp
 				return nil, errors.New("already compacted")
 			}
 		}
-		return nil, errors.New("nothing to compact")
+		return nil, ErrNothingToCompact
 	}
 
 	var headers map[string]string
@@ -480,13 +514,13 @@ func (s *AgentSession) compactContext(compactionCtx context.Context, reason Comp
 		result, err = next(compactionCtx, req)
 	}
 	if err != nil {
-		if compactionCtx.Err() != nil {
-			return nil, fmt.Errorf("compaction cancelled: %w", compactionCtx.Err())
+		if ctxErr := compactionCtx.Err(); ctxErr != nil {
+			return nil, compactionStopped(ctxErr)
 		}
 		return nil, err
 	}
 	if err := compactionCtx.Err(); err != nil {
-		return nil, fmt.Errorf("compaction cancelled: %w", err)
+		return nil, compactionStopped(err)
 	}
 	if result == nil {
 		return nil, errors.New("compaction hook returned no result")
@@ -511,14 +545,19 @@ func (s *AgentSession) compactContext(compactionCtx context.Context, reason Comp
 		fromHook = &replaced
 	}
 
-	if _, err := s.SessionManager.AppendCompaction(
-		compactionCtx,
+	// Past this point the summary is complete, so cancellation must not leave a
+	// write half-done. Bound it like message writes so a stuck store fails.
+	persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(compactionCtx), messagePersistTimeout)
+	_, err = s.SessionManager.AppendCompaction(
+		persistCtx,
 		result.Summary,
 		result.FirstKeptEntryID,
 		result.TokensBefore,
 		details,
 		fromHook,
-	); err != nil {
+	)
+	cancelPersist()
+	if err != nil {
 		return nil, err
 	}
 
@@ -528,6 +567,13 @@ func (s *AgentSession) compactContext(compactionCtx context.Context, reason Comp
 	}
 
 	return result, nil
+}
+
+func compactionStopped(ctxErr error) error {
+	if errors.Is(ctxErr, context.DeadlineExceeded) {
+		return fmt.Errorf("compaction timed out: %w", ctxErr)
+	}
+	return fmt.Errorf("compaction cancelled: %w", ctxErr)
 }
 
 func branchContains(entries []SessionEntry, id string) bool {
@@ -574,11 +620,10 @@ func (s *AgentSession) Prompt(ctx context.Context, text string, options *PromptO
 	message.Timestamp = time.Now().UnixMilli()
 
 	s.mu.Lock()
-	if s.compactionCancel != nil && !s.autoRunning {
-		s.mu.Unlock()
-		return errors.New("compaction in progress")
-	}
-	busy := s.managedRun || s.autoRunning || s.IsStreaming()
+	// A manual compaction aborts the active run, so this prompt waits for it
+	// below instead of joining that run's queue.
+	manualCompaction := s.manualCompactionDone != nil
+	busy := !manualCompaction && (s.managedRun || s.autoRunning || s.IsStreaming())
 	automatic := s.autoRunning
 	if busy && (options != nil && options.StreamingBehavior != "" || !automatic) {
 		defer s.mu.Unlock()
@@ -601,15 +646,29 @@ func (s *AgentSession) Prompt(ctx context.Context, text string, options *PromptO
 	}
 	s.mu.Unlock()
 
-	s.operationMu.Lock()
+	// Each pass waits out any manual compaction, then rechecks while holding
+	// operationMu, since another Compact may have started in between.
+	for {
+		s.mu.Lock()
+		done := s.manualCompactionDone
+		s.mu.Unlock()
+		if done != nil {
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		s.operationMu.Lock()
+		s.mu.Lock()
+		if s.manualCompactionDone == nil {
+			break
+		}
+		s.mu.Unlock()
+		s.operationMu.Unlock()
+	}
 	defer s.operationMu.Unlock()
 	ctx, cancel := context.WithCancel(ctx)
-	s.mu.Lock()
-	if s.compactionCancel != nil {
-		s.mu.Unlock()
-		cancel()
-		return errors.New("compaction in progress")
-	}
 	s.managedRun = true
 	s.runCancel = cancel
 	s.mu.Unlock()
@@ -784,7 +843,8 @@ func (s *AgentSession) runAutoCompaction(ctx context.Context, reason CompactionR
 		end := CompactionEndEvent{Type: "compaction_end", Reason: reason, Result: result}
 		if err != nil {
 			end.Aborted = isCompactionAbort(compactionCtx, err)
-			if !end.Aborted {
+			nothingToCompact := reason == CompactionReasonThreshold && errors.Is(err, ErrNothingToCompact)
+			if !end.Aborted && !nothingToCompact {
 				prefix := "Auto-compaction failed"
 				if reason == CompactionReasonOverflow {
 					prefix = "Context overflow recovery failed"

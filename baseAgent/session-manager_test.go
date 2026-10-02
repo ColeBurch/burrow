@@ -2,12 +2,18 @@ package baseAgent
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/ColeBurch/burrow/ai"
 )
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
 func ptr(s string) *string { return &s }
 
@@ -85,6 +91,10 @@ func assistantText(t *testing.T, m any) string {
 	}
 	return c.Text
 }
+
+// ============================================================================
+// BuildSessionContext
+// ============================================================================
 
 func TestBuildSessionContextTrivialCases(t *testing.T) {
 	t.Run("empty entries returns empty context", func(t *testing.T) {
@@ -220,6 +230,10 @@ func TestBuildSessionContextEdgeCases(t *testing.T) {
 	})
 }
 
+// ============================================================================
+// ResetLeaf
+// ============================================================================
+
 func resetLeafUserMessage(text string) ai.UserMessage {
 	return ai.UserMessage{
 		Role: ai.RoleUser,
@@ -246,7 +260,9 @@ func TestSessionManagerResetLeafBuildsEmptyContext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sm.ResetLeaf()
+	if err := sm.ResetLeaf(ctx); err != nil {
+		t.Fatal(err)
+	}
 	got := sm.BuildSessionContext()
 
 	if len(got.Messages) != 0 {
@@ -271,7 +287,9 @@ func TestSessionManagerAppendAfterResetCreatesIsolatedRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sm.ResetLeaf()
+	if err := sm.ResetLeaf(ctx); err != nil {
+		t.Fatal(err)
+	}
 	newID, err := sm.AppendMessage(ctx, resetLeafUserMessage("Use PostgreSQL"))
 	if err != nil {
 		t.Fatal(err)
@@ -314,7 +332,9 @@ func TestSessionManagerResetLeafAfterCompactionBuildsEmptyContext(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	sm.ResetLeaf()
+	if err := sm.ResetLeaf(ctx); err != nil {
+		t.Fatal(err)
+	}
 	got := sm.BuildSessionContext()
 
 	if len(got.Messages) != 0 {
@@ -333,18 +353,327 @@ func TestSessionManagerResetLeafDoesNotSelectLatestRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sm.ResetLeaf()
+	if err := sm.ResetLeaf(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := sm.AppendMessage(ctx, resetLeafUserMessage("latest root")); err != nil {
 		t.Fatal(err)
 	}
-	if err := sm.SetLeaf(firstRootID); err != nil {
+	if err := sm.SetLeaf(ctx, firstRootID); err != nil {
 		t.Fatal(err)
 	}
 
-	sm.ResetLeaf()
+	if err := sm.ResetLeaf(ctx); err != nil {
+		t.Fatal(err)
+	}
 	got := sm.BuildSessionContext()
 
 	if len(got.Messages) != 0 {
 		t.Fatalf("message count after resetting from an older root = %d, want 0", len(got.Messages))
+	}
+}
+
+// ============================================================================
+// Session Store
+// ============================================================================
+
+// positionSessionStore keeps sessions in memory and checks the current position
+// the way the SessionStore contract requires. The full contract is checked by
+// sessionstoretest, which this package cannot import.
+type positionSessionStore struct {
+	appendErrorSessionStore
+	sessions map[string]*LoadedSession
+}
+
+func newPositionSessionStore() *positionSessionStore {
+	return &positionSessionStore{sessions: map[string]*LoadedSession{}}
+}
+
+func (s *positionSessionStore) CreateSession(_ context.Context, header SessionHeader, entries []SessionEntry) error {
+	session := &LoadedSession{Header: header, Entries: entries}
+	if len(entries) > 0 {
+		session.CurrentEntryID = &entries[len(entries)-1].GetBase().ID
+	}
+	s.sessions[header.ID] = session
+	return nil
+}
+
+func (s *positionSessionStore) AppendEntry(_ context.Context, sessionID string, entry SessionEntry) error {
+	session := s.sessions[sessionID]
+	if !reflect.DeepEqual(entry.GetBase().ParentID, session.CurrentEntryID) {
+		return ErrSessionConflict
+	}
+	session.Entries = append(session.Entries, entry)
+	session.CurrentEntryID = &entry.GetBase().ID
+	return nil
+}
+
+func (s *positionSessionStore) SetCurrentEntry(_ context.Context, sessionID string, expected, entryID *string) error {
+	session := s.sessions[sessionID]
+	if !reflect.DeepEqual(expected, session.CurrentEntryID) {
+		return ErrSessionConflict
+	}
+	session.CurrentEntryID = entryID
+	return nil
+}
+
+func (s *positionSessionStore) LoadSession(_ context.Context, sessionID string) (LoadedSession, error) {
+	session, ok := s.sessions[sessionID]
+	if !ok {
+		return LoadedSession{}, ErrSessionNotFound
+	}
+	return *session, nil
+}
+
+func newStoredSession(t *testing.T, ctx context.Context, store SessionStore, texts ...string) (*SessionManager, []string) {
+	t.Helper()
+	sm, err := NewSessionManager(ctx, nil, nil, true, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, len(texts))
+	for i, text := range texts {
+		if ids[i], err = sm.AppendMessage(ctx, resetLeafUserMessage(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return sm, ids
+}
+
+func reloadSession(t *testing.T, ctx context.Context, store SessionStore, id string) *SessionManager {
+	t.Helper()
+	sm, err := NewSessionManager(ctx, nil, &id, true, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sm
+}
+
+// After a branch, the newest entry is on the abandoned branch. Reloading must
+// resume at the saved position, not at the last entry.
+func TestSessionManagerReloadResumesSavedPosition(t *testing.T) {
+	ctx := context.Background()
+	store := newPositionSessionStore()
+	sm, ids := newStoredSession(t, ctx, store, "a", "b", "c")
+
+	if err := sm.SetLeaf(ctx, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if got := reloadSession(t, ctx, store, sm.GetSessionID()).GetLeafID(); got == nil || *got != ids[0] {
+		t.Fatalf("reloaded leaf = %v, want %s", got, ids[0])
+	}
+
+	if err := sm.ResetLeaf(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := reloadSession(t, ctx, store, sm.GetSessionID()).GetLeafID(); got != nil {
+		t.Fatalf("reloaded leaf after ResetLeaf = %s, want nil", *got)
+	}
+}
+
+// Two live managers for one session: the second writer's stale view is
+// rejected instead of silently forking the history, and Reload recovers.
+func TestSessionManagerDetectsAnotherWriter(t *testing.T) {
+	ctx := context.Background()
+	store := newPositionSessionStore()
+	first, ids := newStoredSession(t, ctx, store, "a")
+	second := reloadSession(t, ctx, store, first.GetSessionID())
+
+	latest, err := first.AppendMessage(ctx, resetLeafUserMessage("from first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.AppendMessage(ctx, resetLeafUserMessage("from second")); !errors.Is(err, ErrSessionConflict) {
+		t.Fatalf("stale AppendMessage() error = %v, want ErrSessionConflict", err)
+	}
+	if err := second.ResetLeaf(ctx); !errors.Is(err, ErrSessionConflict) {
+		t.Fatalf("stale ResetLeaf() error = %v, want ErrSessionConflict", err)
+	}
+	if got := second.GetLeafID(); got == nil || *got != ids[0] {
+		t.Errorf("leaf after a rejected ResetLeaf = %v, want unchanged %s", got, ids[0])
+	}
+
+	if err := second.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	id, err := second.AppendMessage(ctx, resetLeafUserMessage("from second"))
+	if err != nil {
+		t.Fatalf("AppendMessage() after Reload error = %v", err)
+	}
+	if parent := second.GetEntry(id).GetBase().ParentID; parent == nil || *parent != latest {
+		t.Errorf("parent after Reload = %v, want the other writer's entry %s", parent, latest)
+	}
+}
+
+// Concurrent writers on one manager must each build on the previous write.
+func TestSessionManagerSerializesConcurrentAppends(t *testing.T) {
+	ctx := context.Background()
+	sm, _ := newStoredSession(t, ctx, newPositionSessionStore())
+	var wg sync.WaitGroup
+	errs := make(chan error, 20)
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := sm.AppendMessage(ctx, resetLeafUserMessage("concurrent"))
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent AppendMessage() error = %v", err)
+		}
+	}
+	if got := len(sm.GetBranch()); got != 20 {
+		t.Errorf("branch length = %d, want every append on one path (20)", got)
+	}
+}
+
+// BranchWithSummary moves the stored position before appending, so the
+// summary entry passes the store's parent check.
+func TestSessionManagerBranchWithSummary(t *testing.T) {
+	ctx := context.Background()
+	store := newPositionSessionStore()
+	sm, ids := newStoredSession(t, ctx, store, "a", "b")
+
+	id, err := sm.BranchWithSummary(ctx, &ids[0], "tried b", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded := reloadSession(t, ctx, store, sm.GetSessionID())
+	if got := reloaded.GetLeafID(); got == nil || *got != id {
+		t.Fatalf("reloaded leaf = %v, want the summary %s", got, id)
+	}
+	messages := reloaded.BuildSessionContext().Messages
+	if len(messages) != 2 {
+		t.Fatalf("context = %d messages, want a and the summary", len(messages))
+	}
+	if summary, ok := messages[1].(BranchSummaryMessage); !ok || summary.Summary != "tried b" {
+		t.Errorf("context[1] = %#v, want the branch summary", messages[1])
+	}
+}
+
+// ============================================================================
+// Forking
+// ============================================================================
+
+func TestSessionManagerForkKeepsEntryIDsAndLabels(t *testing.T) {
+	ctx := context.Background()
+	store := newPositionSessionStore()
+	header := &SessionHeader{ID: "custom-id"}
+	sm, err := NewSessionManager(ctx, header, nil, true, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := sm.AppendMessage(ctx, resetLeafUserMessage("a"))
+	label := "start"
+	labelID, err := sm.AppendLabelChange(ctx, a, &label)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := sm.AppendMessage(ctx, resetLeafUserMessage("b"))
+
+	forked, err := sm.Fork(ctx, &b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded := reloadSession(t, ctx, store, forked.GetSessionID())
+	if got := reloaded.GetHeader().ParentSession; got == nil || *got != "custom-id" {
+		t.Errorf("ParentSession = %v, want custom-id", got)
+	}
+	entries := reloaded.GetEntries()
+	var got []string
+	for _, entry := range entries {
+		got = append(got, entry.GetBase().ID)
+	}
+	if len(got) != 3 || got[0] != a || got[1] != b || got[2] == labelID {
+		t.Fatalf("forked entries = %v, want %s, %s and a new label entry", got, a, b)
+	}
+	if parent := entries[1].GetBase().ParentID; parent == nil || *parent != a {
+		t.Errorf("b's parent = %v, want %s once the old label is dropped", parent, a)
+	}
+	if got := reloaded.GetLabel(a); got == nil || *got != label {
+		t.Errorf("forked label = %v, want %q", got, label)
+	}
+	if got, want := entries[2].GetBase().Timestamp, sm.GetEntry(labelID).GetBase().Timestamp; got != want {
+		t.Errorf("label timestamp = %s, want the original %s", got, want)
+	}
+	if leaf := reloaded.GetLeafID(); leaf == nil || *leaf != got[2] {
+		t.Errorf("forked leaf = %v, want the label entry %s", leaf, got[2])
+	}
+
+	root, err := sm.Fork(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries := reloadSession(t, ctx, store, root.GetSessionID()).GetEntries(); len(entries) != 0 {
+		t.Errorf("root fork entries = %d, want 0", len(entries))
+	}
+}
+
+// ============================================================================
+// GetBranches
+// ============================================================================
+
+func TestSessionManagerGetBranches(t *testing.T) {
+	ctx := context.Background()
+	sm, err := InMemorySessionManager(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := func(text string) string {
+		id, err := sm.AppendMessage(ctx, resetLeafUserMessage(text))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	reply := func() string {
+		id, err := sm.AppendMessage(ctx, ai.AssistantMessage{Role: ai.RoleAssistant})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	setLeaf := func(id string) {
+		if err := sm.SetLeaf(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// q1 ─┬─ reply1                    (regenerated)
+	//     └─ reply2 ─┬─ q2 ─ reply3
+	//                └─ q3 ─ label "alt"   (current)
+	q1 := user("q1")
+	reply1 := reply()
+	setLeaf(q1)
+	reply2 := reply()
+	q2 := user("q2")
+	reply3 := reply()
+	setLeaf(reply2)
+	q3 := user("q3")
+	alt := "alt"
+	labelEntry, err := sm.AppendLabelChange(ctx, q3, &alt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []SessionBranch{
+		{LeafID: reply1, BranchPointID: &q1, FirstEntryID: reply1, FirstMessage: "q1"},
+		{LeafID: reply3, BranchPointID: &reply2, FirstEntryID: q2, FirstMessage: "q2"},
+		{LeafID: labelEntry, BranchPointID: &reply2, FirstEntryID: q3, Label: &alt, FirstMessage: "q3", Active: true},
+	}
+	if got := sm.GetBranches(); !reflect.DeepEqual(got, want) {
+		t.Errorf("GetBranches() = %+v, want %+v", got, want)
+	}
+
+	// At a branch point, before the next append, no branch is active.
+	setLeaf(reply2)
+	for _, branch := range sm.GetBranches() {
+		if branch.Active {
+			t.Errorf("branch %s is active at a branch point", branch.LeafID)
+		}
 	}
 }

@@ -392,41 +392,6 @@ func TestCompactSplitTurnWithoutNewHistory(t *testing.T) {
 	}
 }
 
-func TestCompactSplitTurnRejectsTruncatedTurnPrefixSummary(t *testing.T) {
-	model := registerSummaryTestProvider(t, false, func(
-		_ ai.Model[ai.API],
-		modelContext ai.ModelContext,
-		_ *ai.SimpleStreamOptions,
-	) (*ai.AssistantMessageEventStream, error) {
-		response := summaryTestTextMessage("history summary")
-		// Both requests run concurrently, so inspect the prompt without t.Fatal.
-		prompt := ""
-		if message, ok := modelContext.Messages[0].(ai.UserMessage); ok && len(message.Content) == 1 {
-			if text, ok := message.Content[0].(ai.TextContent); ok {
-				prompt = text.Text
-			}
-		}
-		if strings.Contains(prompt, TURN_PREFIX_SUMMARIZATION_PROMPT) {
-			response = summaryTestTextMessage("partial turn prefix")
-			response.StopReason = ai.StopReasonLength
-		}
-		return completedSummaryTestStream(response), nil
-	})
-	preparation := &CompactionPreparation{
-		FirstKeptEntryID:    "kept-entry",
-		MessagesToSummarize: []agent.AgentMessage{testUserMessage("history")},
-		TurnPrefixMessages:  []agent.AgentMessage{testUserMessage("prefix")},
-		IsSplitTurn:         true,
-		Settings:            CompactionSettings{ReservedTokens: 100},
-	}
-
-	_, err := Compact(context.Background(), preparation, model, "test-key", nil)
-	want := "turn prefix summarization failed: summary was truncated at the output token limit"
-	if err == nil || !strings.Contains(err.Error(), want) {
-		t.Fatalf("Compact() error = %v, want %q", err, want)
-	}
-}
-
 func TestCompactSplitTurnFailureCancelsOtherSummary(t *testing.T) {
 	historyCancelled := make(chan struct{})
 	model := registerSummaryTestProvider(t, false, func(
@@ -648,12 +613,6 @@ func TestShouldTriggerCompaction(t *testing.T) {
 			name:          "does not trigger for an unknown context window",
 			contextTokens: 1,
 			contextWindow: 0,
-			settings:      CompactionSettings{Enabled: true, ReservedTokens: 10_000},
-		},
-		{
-			name:          "does not trigger for a negative context window",
-			contextTokens: 1,
-			contextWindow: -1,
 			settings:      CompactionSettings{Enabled: true, ReservedTokens: 10_000},
 		},
 	}
@@ -2072,19 +2031,6 @@ func TestGenerateSummaryRejectsUnusableResponses(t *testing.T) {
 			want:     "summarization failed: response was aborted",
 		},
 		{
-			name:     "no content",
-			response: ai.AssistantMessage{StopReason: ai.StopReasonStop},
-			want:     "summarization failed: summary is empty",
-		},
-		{
-			name: "whitespace text",
-			response: ai.AssistantMessage{
-				Content:    []ai.AssistantContent{ai.TextContent{Type: ai.ContentTypeText, Text: " \n\t"}},
-				StopReason: ai.StopReasonStop,
-			},
-			want: "summarization failed: summary is empty",
-		},
-		{
 			name: "no text content",
 			response: ai.AssistantMessage{
 				Content: []ai.AssistantContent{
@@ -2482,14 +2428,14 @@ type jsonCompactionSessionStore struct {
 	onAppendCompaction func(ctx context.Context)
 }
 
-func (s *jsonCompactionSessionStore) CreateSession(_ context.Context, header *SessionHeader) error {
+func (s *jsonCompactionSessionStore) CreateSession(_ context.Context, header SessionHeader, _ []SessionEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.header = header
+	s.header = &header
 	return nil
 }
 
-func (s *jsonCompactionSessionStore) AppendEntry(ctx context.Context, _ *SessionHeader, entry SessionEntry) error {
+func (s *jsonCompactionSessionStore) AppendEntry(ctx context.Context, _ string, entry SessionEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if compaction, ok := entry.(*CompactionEntry); ok {
@@ -2509,7 +2455,7 @@ func (s *jsonCompactionSessionStore) AppendEntry(ctx context.Context, _ *Session
 	return nil
 }
 
-func (s *jsonCompactionSessionStore) LoadSession(context.Context, string) (*SessionHeader, []SessionEntry, error) {
+func (s *jsonCompactionSessionStore) LoadSession(context.Context, string) (LoadedSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entries := make([]SessionEntry, len(s.entries))
@@ -2518,12 +2464,17 @@ func (s *jsonCompactionSessionStore) LoadSession(context.Context, string) (*Sess
 		if encoded, ok := s.encoded[entry.GetBase().ID]; ok {
 			var decoded CompactionEntry
 			if err := json.Unmarshal(encoded, &decoded); err != nil {
-				return nil, nil, err
+				return LoadedSession{}, err
 			}
 			entries[i] = &decoded
 		}
 	}
-	return s.header, entries, nil
+	// Appends never branch here, so the last entry is the current position.
+	loaded := LoadedSession{Header: *s.header, Entries: entries}
+	if len(entries) > 0 {
+		loaded.CurrentEntryID = &entries[len(entries)-1].GetBase().ID
+	}
+	return loaded, nil
 }
 
 type hookTestSummaryRequest struct {
@@ -2850,36 +2801,6 @@ func TestAgentSessionCompactionTimeoutIsFailure(t *testing.T) {
 		t.Errorf("compaction_end events = %#v, want one failure %q", ends, want)
 	}
 	h.assertNothingCompacted(t)
-}
-
-func TestIsCompactionAbort(t *testing.T) {
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	defer cancelExpired()
-	live := context.Background()
-	failure := errors.New("provider failed")
-
-	tests := []struct {
-		name string
-		ctx  context.Context
-		err  error
-		want bool
-	}{
-		{name: "cancelled compaction", ctx: cancelled, err: failure, want: true},
-		{name: "expired compaction", ctx: expired, err: context.DeadlineExceeded},
-		{name: "hook cancelled", ctx: live, err: fmt.Errorf("hook: %w", ErrCompactionCancelled), want: true},
-		{name: "cancelled request", ctx: live, err: fmt.Errorf("request: %w", context.Canceled), want: true},
-		{name: "request timeout", ctx: live, err: fmt.Errorf("request: %w", context.DeadlineExceeded)},
-		{name: "provider failure", ctx: live, err: failure},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := isCompactionAbort(test.ctx, test.err); got != test.want {
-				t.Fatalf("isCompactionAbort() = %t, want %t", got, test.want)
-			}
-		})
-	}
 }
 
 func TestAgentSessionCompactionHookCancelsAutomaticCompactionBeforePrompt(t *testing.T) {

@@ -3,14 +3,14 @@ module github.com/ColeBurch/burrow/baseAgent
 go 1.26.3
 
 require (
-	github.com/ColeBurch/burrow/agent v0.2.0
-	github.com/ColeBurch/burrow/ai v0.2.0
+	github.com/ColeBurch/burrow/agent v0.3.0
+	github.com/ColeBurch/burrow/ai v0.3.0
 	github.com/google/uuid v1.6.0
+	github.com/govalues/decimal v0.1.36
 	golang.org/x/sync v0.22.0
 )
 
 require (
-	github.com/govalues/decimal v0.1.36 // indirect
 	github.com/openai/openai-go/v3 v3.35.0 // indirect
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect

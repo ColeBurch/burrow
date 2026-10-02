@@ -91,9 +91,11 @@ func (CompactionEndEvent) EventType() string { return "compaction_end" }
 // CompactionRequest describes one compaction of the active branch. Hooks may
 // change a copy before passing it to next, but must not modify the entries.
 type CompactionRequest struct {
-	Reason             CompactionReason
-	Preparation        *CompactionPreparation
-	BranchEntries      []SessionEntry
+	Reason        CompactionReason
+	Preparation   *CompactionPreparation
+	BranchEntries []SessionEntry
+	// Session is the session being compacted, for reading only.
+	Session            ReadonlySessionManager
 	CustomInstructions string
 	// Prompts starts as DefaultSummaryPrompts.
 	Prompts SummaryPrompts
@@ -108,7 +110,7 @@ type CompactFunc func(ctx context.Context, req CompactionRequest) (*CompactionRe
 //
 // The hook runs with session operations blocked and the agent idle. It must
 // not call AgentSession methods other than AbortCompaction and IsCompacting,
-// and must not write to the SessionManager.
+// and must not write to the session; req.Session gives it read access.
 type CompactionHook func(ctx context.Context, req CompactionRequest, next CompactFunc) (*CompactionResult, error)
 
 // ErrCompactionCancelled is returned by a CompactionHook to cancel compaction.
@@ -355,7 +357,7 @@ func (s *AgentSession) GetSessionID() (string, error) {
 	if s.Agent == nil {
 		return "", errors.New("no agent set")
 	}
-	return s.SessionManager.sessionID, nil
+	return s.SessionManager.GetSessionID(), nil
 }
 
 /** Current session name */
@@ -487,6 +489,7 @@ func (s *AgentSession) compactContext(compactionCtx context.Context, reason Comp
 		Reason:        reason,
 		Preparation:   preparation,
 		BranchEntries: pathEntries,
+		Session:       s.SessionManager,
 		Prompts:       DefaultSummaryPrompts(),
 	}
 	if options != nil {

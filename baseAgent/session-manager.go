@@ -3,8 +3,11 @@ package baseAgent
 import (
 	"context"
 	"errors"
-	"sort"
+	"fmt"
+	"maps"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ColeBurch/burrow/agent"
@@ -21,8 +24,6 @@ type SessionHeader struct {
 	Timestamp     string         `json:"timestamp"`
 	ParentSession *string        `json:"parentSession,omitempty"`
 	Name          *string        `json:"name,omitempty"`
-	MessageCount  int64          `json:"messageCount,omitempty"`
-	FirstMessage  *string        `json:"firstMessage,omitempty"`
 	Metadata      map[string]any `json:"metadata,omitempty"`
 }
 
@@ -116,38 +117,78 @@ type SessionContext struct {
 }
 type SessionModel struct{ Provider, ModelID string }
 
-type SessionInfo struct {
-	ID                      string
-	Name, ParentSessionPath *string
-	Created, Modified       time.Time
-	MessageCount            int
-	FirstMessage            string
-}
-type SessionListProgress func(loaded, total int)
-
-type SessionStore interface {
-	CreateSession(ctx context.Context, header *SessionHeader) error
-	LoadSession(ctx context.Context, sessionID string) (*SessionHeader, []SessionEntry, error)
-	AppendEntry(ctx context.Context, header *SessionHeader, entry SessionEntry) error
-	ListSessions(ctx context.Context, metadata map[string]any) ([]SessionInfo, error)
-	FindMostRecentSession(ctx context.Context, metadata map[string]any) (*SessionInfo, error)
-	CreateBranch(ctx context.Context, fromLeafID string, newHeader SessionHeader) error
-}
-
+// SessionManager holds a session's entry tree and current position, and saves
+// changes through a SessionStore when persisted. It is safe for concurrent use.
+//
+// Its methods only lock mu and delegate to state. Writes hold mu across their
+// store call, so each entry's parent is the position the previous write left,
+// and reads wait for an in-flight write rather than see the state before it.
 type SessionManager struct {
-	sessionID string
-	persist   bool
+	mu    sync.RWMutex
+	state sessionState
+}
 
-	Header  *SessionHeader
-	Entries []SessionEntry
+// sessionState is everything SessionManager.mu guards. Its methods never lock
+// and cannot reach SessionManager's, so code holding the lock cannot deadlock
+// by calling back into a locking method.
+type sessionState struct {
+	sessionID string
+	header    *SessionHeader
+	entries   []SessionEntry
 
 	byID                map[string]SessionEntry
 	labelsByID          map[string]string
 	labelTimestampsByID map[string]string
 	leafID              *string
 
-	Store SessionStore
+	persist bool
+	store   SessionStore
 }
+
+// ReadonlySessionManager is the read side of SessionManager, for code such as
+// hooks that may inspect the session but must not write to it.
+type ReadonlySessionManager interface {
+	GetSessionID() string
+	GetHeader() *SessionHeader
+	GetSessionName() *string
+	GetLeafID() *string
+	GetLeafEntry() SessionEntry
+	GetEntry(id string) SessionEntry
+	GetChildren(parentID string) []SessionEntry
+	GetLabel(id string) *string
+	GetBranch(from ...string) []SessionEntry
+	GetBranches() []SessionBranch
+	GetEntries() []SessionEntry
+	GetTree() []*SessionTreeNode
+	BuildSessionContext() SessionContext
+}
+
+var _ ReadonlySessionManager = (*SessionManager)(nil)
+
+// SessionBranch is one branch of a session's entry tree: the path from the
+// root to a leaf, an entry with no children.
+type SessionBranch struct {
+	// LeafID is the branch's last entry. SetLeaf(LeafID) switches to it.
+	LeafID string
+	// BranchPointID is the nearest entry above the leaf with more than one
+	// child, where this branch splits from its siblings. It is nil when the
+	// branch splits from another root, or the session has a single branch.
+	BranchPointID *string
+	// FirstEntryID is the first entry after BranchPointID. The branch's own
+	// entries run from it to LeafID.
+	FirstEntryID string
+	// Label is the label nearest the leaf on the branch's own entries.
+	Label *string
+	// FirstMessage is the text of the first user message on the branch's own
+	// entries. If they have none, as when a reply was regenerated, it is the
+	// last user message before them.
+	FirstMessage string
+	// Active reports whether the current position is on the branch's own
+	// entries. At a branch point, before the next append, no branch is active.
+	Active bool
+}
+
+var errStoreRequired = errors.New("store required for persistent session")
 
 func createSessionID() string { return uuid.NewString() }
 
@@ -257,22 +298,43 @@ func BuildSessionContext(entries []SessionEntry, leafID *string, byID map[string
 	return SessionContext{msgs, thinking, model}
 }
 
+// NewDefaultSessionHeader returns a header for a new session with a fresh ID.
 func NewDefaultSessionHeader(parentSession *string, metadata map[string]any) *SessionHeader {
-	return &SessionHeader{
-		Type:          "session",
-		Version:       CurrentSessionVersion,
-		ID:            createSessionID(),
-		Timestamp:     time.Now().Format(time.RFC3339),
-		ParentSession: parentSession,
-		Name:          nil,
-		MessageCount:  0,
-		FirstMessage:  nil,
-		Metadata:      metadata,
-	}
+	header := completeHeader(&SessionHeader{ParentSession: parentSession}, metadata)
+	return &header
 }
 
+// completeHeader returns a copy of header with its empty fields filled in, so
+// a caller can pass only the fields it cares about, such as a custom ID.
+func completeHeader(header *SessionHeader, metadata map[string]any) SessionHeader {
+	var h SessionHeader
+	if header != nil {
+		h = *header
+	}
+	if h.Type == "" {
+		h.Type = "session"
+	}
+	if h.Version == 0 {
+		h.Version = CurrentSessionVersion
+	}
+	if h.ID == "" {
+		h.ID = createSessionID()
+	}
+	if h.Timestamp == "" {
+		h.Timestamp = nowISO()
+	}
+	if h.Metadata == nil {
+		h.Metadata = metadata
+	}
+	return h
+}
+
+// NewSessionManager loads the stored session sessionID, or creates a new
+// session when sessionID is nil. A new session uses header, with any empty
+// fields filled in: pass &SessionHeader{ID: id} for a custom session ID.
+// metadata is used when header has none.
 func NewSessionManager(ctx context.Context, header *SessionHeader, sessionID *string, persist bool, store SessionStore, metadata map[string]any) (*SessionManager, error) {
-	sm := &SessionManager{persist: persist, byID: map[string]SessionEntry{}, labelsByID: map[string]string{}, labelTimestampsByID: map[string]string{}, Store: store}
+	sm := &SessionManager{state: sessionState{persist: persist, store: store}}
 
 	if sessionID != nil {
 		if store == nil {
@@ -284,167 +346,320 @@ func NewSessionManager(ctx context.Context, header *SessionHeader, sessionID *st
 		return sm, nil
 	}
 
-	if header == nil {
-		header = NewDefaultSessionHeader(nil, metadata)
-	}
-
 	if err := sm.NewSession(ctx, header, metadata); err != nil {
 		return nil, err
 	}
-
 	return sm, nil
 }
 
+func InMemorySessionManager(ctx context.Context) (*SessionManager, error) {
+	return NewSessionManager(ctx, nil, nil, false, nil, nil)
+}
+
+// ============================================================================
+// Loading and Creating
+// ============================================================================
+
+// LoadSession switches the manager to a stored session, resuming at its saved
+// position. On error the manager is unchanged.
 func (s *SessionManager) LoadSession(ctx context.Context, id string) error {
-	header, entries, err := s.Store.LoadSession(ctx, id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.load(ctx, id)
+}
+
+// Reload replaces the manager's state with the stored session, such as after
+// ErrSessionConflict reports that another writer changed it.
+func (s *SessionManager) Reload(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.state.persist {
+		return errors.New("cannot reload a session that is not persisted")
+	}
+	return s.state.load(ctx, s.state.sessionID)
+}
+
+// NewSession switches the manager to a new, empty session. See NewSessionManager
+// for header and metadata. On error the manager is unchanged.
+func (s *SessionManager) NewSession(ctx context.Context, header *SessionHeader, metadata map[string]any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.create(ctx, completeHeader(header, metadata))
+}
+
+func (s *SessionManager) IsPersisted() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.persist
+}
+
+func (st *sessionState) load(ctx context.Context, id string) error {
+	if st.store == nil {
+		return errStoreRequired
+	}
+	loaded, err := st.store.LoadSession(ctx, id)
 	if err != nil {
 		return err
 	}
-
-	s.sessionID = id
-	s.Header = header
-	s.Entries = entries
-	s.buildIndex()
-
+	// The stored position, not the last entry: after a branch the newest
+	// entry can be on another branch.
+	if current := loaded.CurrentEntryID; current != nil && !slices.ContainsFunc(loaded.Entries, func(e SessionEntry) bool {
+		return e.GetBase().ID == *current
+	}) {
+		return fmt.Errorf("session %q: current entry %q not found", id, *current)
+	}
+	st.reset(id, loaded.Header, loaded.Entries, loaded.CurrentEntryID)
 	return nil
 }
 
-func (s *SessionManager) NewSession(ctx context.Context, header *SessionHeader, metadata map[string]any) error {
-	if header == nil {
-		header = NewDefaultSessionHeader(nil, metadata)
-	}
-
-	s.sessionID = header.ID
-	s.Header = header
-	s.Entries = []SessionEntry{}
-	s.byID = map[string]SessionEntry{}
-	s.labelsByID = map[string]string{}
-	s.labelTimestampsByID = map[string]string{}
-	s.leafID = nil
-
-	if s.persist {
-		if s.Store == nil {
-			return errors.New("store required for persistent session")
+func (st *sessionState) create(ctx context.Context, header SessionHeader) error {
+	if st.persist {
+		if st.store == nil {
+			return errStoreRequired
 		}
-
-		if err := s.Store.CreateSession(ctx, header); err != nil {
+		if err := st.store.CreateSession(ctx, header, nil); err != nil {
 			return err
 		}
 	}
-
+	st.reset(header.ID, header, nil, nil)
 	return nil
 }
 
-func (s *SessionManager) buildIndex() {
-	s.byID = map[string]SessionEntry{}
-	s.labelsByID = map[string]string{}
-	s.labelTimestampsByID = map[string]string{}
-	s.leafID = nil
-	for _, fe := range s.Entries {
-		e, ok := fe.(SessionEntry)
-		if !ok {
-			continue
-		}
-		id := e.GetBase().ID
-		s.byID[id] = e
-		s.leafID = &e.GetBase().ID
-		if l, ok := e.(*LabelEntry); ok {
-			if l.Label != nil && *l.Label != "" {
-				s.labelsByID[l.TargetID] = *l.Label
-				s.labelTimestampsByID[l.TargetID] = l.Timestamp
-			} else {
-				delete(s.labelsByID, l.TargetID)
-				delete(s.labelTimestampsByID, l.TargetID)
-			}
+// reset replaces the session and rebuilds the indexes.
+func (st *sessionState) reset(sessionID string, header SessionHeader, entries []SessionEntry, leafID *string) {
+	st.sessionID = sessionID
+	st.header = &header
+	st.entries = entries
+	st.byID = map[string]SessionEntry{}
+	st.labelsByID = map[string]string{}
+	st.labelTimestampsByID = map[string]string{}
+	for _, e := range entries {
+		st.index(e)
+	}
+	st.leafID = leafID
+}
+
+func (st *sessionState) index(e SessionEntry) {
+	st.byID[e.GetBase().ID] = e
+	if l, ok := e.(*LabelEntry); ok {
+		if l.Label != nil && *l.Label != "" {
+			st.labelsByID[l.TargetID] = *l.Label
+			st.labelTimestampsByID[l.TargetID] = l.Timestamp
+		} else {
+			delete(st.labelsByID, l.TargetID)
+			delete(st.labelTimestampsByID, l.TargetID)
 		}
 	}
 }
 
-func (s *SessionManager) IsPersisted() bool { return s.persist }
+// ============================================================================
+// Appending
+// ============================================================================
 
-func (s *SessionManager) GetSessionID() string { return s.sessionID }
-
-func (s *SessionManager) appendEntry(ctx context.Context, e SessionEntry) error {
-	if s.persist {
-		if s.Store == nil {
-			return errors.New("store required for persistent session")
-		}
-		if err := s.Store.AppendEntry(ctx, s.Header, e); err != nil {
-			return err
-		}
-	}
-	s.Entries = append(s.Entries, e)
-	s.byID[e.GetBase().ID] = e
-	s.leafID = &e.GetBase().ID
-
-	return nil
-}
-
-func (s *SessionManager) base(t string) SessionEntryBase {
-	return SessionEntryBase{t, generateID(), s.leafID, nowISO()}
+// add appends an entry built on the current position and returns its ID.
+func (s *SessionManager) add(ctx context.Context, entryType string, build func(SessionEntryBase) SessionEntry) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.append(ctx, entryType, build)
 }
 
 func (s *SessionManager) AppendMessage(ctx context.Context, m agent.AgentMessage) (string, error) {
-	return s.AppendMessageWithID(ctx, generateID(), m)
+	return s.AppendMessageWithID(ctx, "", m)
 }
 
+// AppendMessageWithID appends a message with the given entry ID, or a fresh
+// one when id is empty.
 func (s *SessionManager) AppendMessageWithID(ctx context.Context, id string, m agent.AgentMessage) (string, error) {
-	base := s.base("message")
-	if id != "" {
-		base.ID = id
-	}
-	e := &SessionMessageEntry{base, m}
-	if err := s.appendEntry(ctx, e); err != nil {
-		return "", err
-	}
-	return e.ID, nil
+	return s.add(ctx, EntryTypeMessage, func(b SessionEntryBase) SessionEntry {
+		if id != "" {
+			b.ID = id
+		}
+		return &SessionMessageEntry{b, m}
+	})
 }
 
 func (s *SessionManager) AppendThinkingLevelChange(ctx context.Context, v string) (string, error) {
-	e := &ThinkingLevelChangeEntry{s.base("thinking_level_change"), v}
-	if err := s.appendEntry(ctx, e); err != nil {
-		return "", err
-	}
-	return e.ID, nil
+	return s.add(ctx, EntryTypeThinkingLevelChange, func(b SessionEntryBase) SessionEntry {
+		return &ThinkingLevelChangeEntry{b, v}
+	})
 }
 
 func (s *SessionManager) AppendModelChange(ctx context.Context, p, m string) (string, error) {
-	e := &ModelChangeEntry{s.base("model_change"), p, m}
-	if err := s.appendEntry(ctx, e); err != nil {
-		return "", err
-	}
-	return e.ID, nil
+	return s.add(ctx, EntryTypeModelChange, func(b SessionEntryBase) SessionEntry {
+		return &ModelChangeEntry{b, p, m}
+	})
 }
 
 func (s *SessionManager) AppendCompaction(ctx context.Context, summary, first string, tokens int64, details any, fromHook *bool) (string, error) {
-	e := &CompactionEntry{s.base("compaction"), summary, first, tokens, details, fromHook}
-	if err := s.appendEntry(ctx, e); err != nil {
-		return "", err
-	}
-	return e.ID, nil
+	return s.add(ctx, EntryTypeCompaction, func(b SessionEntryBase) SessionEntry {
+		return &CompactionEntry{b, summary, first, tokens, details, fromHook}
+	})
 }
 
 func (s *SessionManager) AppendCustomEntry(ctx context.Context, t string, data any) (string, error) {
-	e := &CustomEntry{SessionEntryBase: s.base("custom"), CustomType: t, Data: data}
-	if err := s.appendEntry(ctx, e); err != nil {
-		return "", err
-	}
-	return e.ID, nil
+	return s.add(ctx, EntryTypeCustom, func(b SessionEntryBase) SessionEntry {
+		return &CustomEntry{SessionEntryBase: b, CustomType: t, Data: data}
+	})
 }
 
 func (s *SessionManager) AppendSessionInfo(ctx context.Context, name string) (string, error) {
 	n := strings.TrimSpace(name)
-	e := &SessionInfoEntry{s.base("session_info"), &n}
-	if err := s.appendEntry(ctx, e); err != nil {
-		return "", err
+	return s.add(ctx, EntryTypeSessionInfo, func(b SessionEntryBase) SessionEntry {
+		return &SessionInfoEntry{b, &n}
+	})
+}
+
+func (s *SessionManager) AppendCustomMessageEntry(ctx context.Context, t string, c []ai.UserContent, display bool, details any) (string, error) {
+	return s.add(ctx, EntryTypeCustomMessage, func(b SessionEntryBase) SessionEntry {
+		return &CustomMessageEntry{SessionEntryBase: b, CustomType: t, Content: c, Details: details, Display: display}
+	})
+}
+
+// AppendLabelChange sets the label of an entry, or clears it when label is nil
+// or empty.
+func (s *SessionManager) AppendLabelChange(ctx context.Context, target string, label *string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.appendLabel(ctx, target, label)
+}
+
+func (st *sessionState) appendLabel(ctx context.Context, target string, label *string) (string, error) {
+	if st.byID[target] == nil {
+		return "", fmt.Errorf("entry %q not found", target)
 	}
-	return e.ID, nil
+	return st.append(ctx, EntryTypeLabel, func(b SessionEntryBase) SessionEntry {
+		return &LabelEntry{b, target, label}
+	})
+}
+
+// append saves an entry built on the current position and makes it the
+// current position.
+func (st *sessionState) append(ctx context.Context, entryType string, build func(SessionEntryBase) SessionEntry) (string, error) {
+	e := build(SessionEntryBase{Type: entryType, ID: generateID(), ParentID: st.leafID, Timestamp: nowISO()})
+	if st.persist {
+		if st.store == nil {
+			return "", errStoreRequired
+		}
+		if err := st.store.AppendEntry(ctx, st.sessionID, e); err != nil {
+			return "", err
+		}
+	}
+	st.entries = append(st.entries, e)
+	st.index(e)
+	st.leafID = &e.GetBase().ID
+	return e.GetBase().ID, nil
+}
+
+// ============================================================================
+// Reading
+// ============================================================================
+
+func (s *SessionManager) GetSessionID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.sessionID
+}
+
+// GetHeader returns a copy of the session header.
+func (s *SessionManager) GetHeader() *SessionHeader {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	header := *s.state.header
+	return &header
 }
 
 func (s *SessionManager) GetSessionName() *string {
-	es := s.GetEntries()
-	for i := len(es) - 1; i >= 0; i-- {
-		if e, ok := es[i].(*SessionInfoEntry); ok {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.sessionName()
+}
+
+func (s *SessionManager) GetLeafID() *string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.leafID
+}
+
+func (s *SessionManager) GetLeafEntry() SessionEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.state.leafID == nil {
+		return nil
+	}
+	return s.state.byID[*s.state.leafID]
+}
+
+func (s *SessionManager) GetEntry(id string) SessionEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.byID[id]
+}
+
+// GetEntries returns every entry across all branches, in append order.
+func (s *SessionManager) GetEntries() []SessionEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return slices.Clone(s.state.entries)
+}
+
+// GetChildren returns the entries whose parent is parentID, in append order.
+func (s *SessionManager) GetChildren(parentID string) []SessionEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.children(parentID)
+}
+
+func (s *SessionManager) GetLabel(id string) *string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if v, ok := s.state.labelsByID[id]; ok {
+		return &v
+	}
+	return nil
+}
+
+// GetBranch returns the path from the root to from, or to the current position
+// when from is omitted.
+func (s *SessionManager) GetBranch(from ...string) []SessionEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(from) > 0 {
+		return s.state.path(&from[0])
+	}
+	return s.state.path(s.state.leafID)
+}
+
+func (s *SessionManager) BuildSessionContext() SessionContext {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.state.leafID == nil {
+		return SessionContext{
+			Messages:      []agent.AgentMessage{},
+			ThinkingLevel: "off",
+			Model:         nil,
+		}
+	}
+	return BuildSessionContext(s.state.entries, s.state.leafID, s.state.byID)
+}
+
+// GetTree returns the entry tree, with children in append order.
+func (s *SessionManager) GetTree() []*SessionTreeNode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.tree()
+}
+
+// GetBranches returns every branch of the entry tree, in tree order: depth
+// first, with children in append order.
+func (s *SessionManager) GetBranches() []SessionBranch {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.branches()
+}
+
+func (st *sessionState) sessionName() *string {
+	for i := len(st.entries) - 1; i >= 0; i-- {
+		if e, ok := st.entries[i].(*SessionInfoEntry); ok {
 			if e.Name == nil || strings.TrimSpace(*e.Name) == "" {
 				return nil
 			}
@@ -455,121 +670,50 @@ func (s *SessionManager) GetSessionName() *string {
 	return nil
 }
 
-func (s *SessionManager) AppendCustomMessageEntry(ctx context.Context, t string, c []ai.UserContent, display bool, details any) (string, error) {
-	e := &CustomMessageEntry{SessionEntryBase: s.base("custom_message"), CustomType: t, Content: c, Details: details, Display: display}
-	if err := s.appendEntry(ctx, e); err != nil {
-		return "", err
-	}
-	return e.ID, nil
-}
-
-func (s *SessionManager) GetLeafID() *string { return s.leafID }
-
-func (s *SessionManager) GetLeafEntry() SessionEntry {
-	if s.leafID == nil {
-		return nil
-	}
-	return s.byID[*s.leafID]
-}
-
-func (s *SessionManager) GetEntry(id string) SessionEntry { return s.byID[id] }
-
-func (s *SessionManager) GetChildren(parentID string) []SessionEntry {
+func (st *sessionState) children(parentID string) []SessionEntry {
 	var out []SessionEntry
-	for _, e := range s.byID {
-		if e.GetBase().ParentID != nil && *e.GetBase().ParentID == parentID {
+	for _, e := range st.entries {
+		if p := e.GetBase().ParentID; p != nil && *p == parentID {
 			out = append(out, e)
 		}
 	}
 	return out
 }
 
-func (s *SessionManager) GetLabel(id string) *string {
-	if v, ok := s.labelsByID[id]; ok {
-		return &v
-	}
-	return nil
-}
-
-func (s *SessionManager) AppendLabelChange(ctx context.Context, target string, label *string) (string, error) {
-	if _, ok := s.byID[target]; !ok {
-		return "", errors.New("entry not found")
-	}
-	e := &LabelEntry{s.base("label"), target, label}
-	if err := s.appendEntry(ctx, e); err != nil {
-		return "", err
-	}
-	if label != nil && *label != "" {
-		s.labelsByID[target] = *label
-		s.labelTimestampsByID[target] = e.Timestamp
-	} else {
-		delete(s.labelsByID, target)
-		delete(s.labelTimestampsByID, target)
-	}
-	return e.ID, nil
-}
-
-func (s *SessionManager) GetBranch(from ...string) []SessionEntry {
-	var start *string = s.leafID
-	if len(from) > 0 {
-		start = &from[0]
+// path returns the entries from the root to id.
+func (st *sessionState) path(id *string) []SessionEntry {
+	if id == nil {
+		return nil
 	}
 	var path []SessionEntry
-	for cur := func() SessionEntry {
-		if start == nil {
-			return nil
-		}
-		return s.byID[*start]
-	}(); cur != nil; {
-		path = append([]SessionEntry{cur}, path...)
-		if cur.GetBase().ParentID == nil {
+	// The length check stops on a parent cycle in corrupt data.
+	for cur := st.byID[*id]; cur != nil && len(path) <= len(st.entries); {
+		path = append(path, cur)
+		parent := cur.GetBase().ParentID
+		if parent == nil {
 			break
 		}
-		cur = s.byID[*cur.GetBase().ParentID]
+		cur = st.byID[*parent]
 	}
+	slices.Reverse(path)
 	return path
 }
 
-func (s *SessionManager) BuildSessionContext() SessionContext {
-	if s.leafID == nil {
-		return SessionContext{
-			Messages:      []agent.AgentMessage{},
-			ThinkingLevel: "off",
-			Model:         nil,
-		}
-	}
-
-	return BuildSessionContext(s.GetEntries(), s.leafID, s.byID)
-}
-
-func (s *SessionManager) GetHeader() *SessionHeader { return s.Header }
-
-func (s *SessionManager) GetEntries() []SessionEntry {
-	out := []SessionEntry{}
-	for _, fe := range s.Entries {
-		if e, ok := fe.(SessionEntry); ok {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-func (s *SessionManager) GetTree() []*SessionTreeNode {
-	entries := s.GetEntries()
+func (st *sessionState) tree() []*SessionTreeNode {
 	nodes := map[string]*SessionTreeNode{}
 	var roots []*SessionTreeNode
-	for _, e := range entries {
+	for _, e := range st.entries {
 		id := e.GetBase().ID
 		var lab, lt *string
-		if v, ok := s.labelsByID[id]; ok {
+		if v, ok := st.labelsByID[id]; ok {
 			lab = &v
 		}
-		if v, ok := s.labelTimestampsByID[id]; ok {
+		if v, ok := st.labelTimestampsByID[id]; ok {
 			lt = &v
 		}
 		nodes[id] = &SessionTreeNode{Entry: e, Children: []*SessionTreeNode{}, Label: lab, LabelTimestamp: lt}
 	}
-	for _, e := range entries {
+	for _, e := range st.entries {
 		n := nodes[e.GetBase().ID]
 		if e.GetBase().ParentID == nil || *e.GetBase().ParentID == e.GetBase().ID {
 			roots = append(roots, n)
@@ -579,131 +723,214 @@ func (s *SessionManager) GetTree() []*SessionTreeNode {
 			roots = append(roots, n)
 		}
 	}
-	var stack []*SessionTreeNode = append([]*SessionTreeNode{}, roots...)
-	for len(stack) > 0 {
-		n := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		sort.Slice(n.Children, func(i, j int) bool {
-			return n.Children[i].Entry.GetBase().Timestamp < n.Children[j].Entry.GetBase().Timestamp
-		})
-		stack = append(stack, n.Children...)
-	}
 	return roots
 }
 
-func (s *SessionManager) SetLeaf(id string) error {
-	if _, ok := s.byID[id]; !ok {
-		return errors.New("entry not found")
+func (st *sessionState) branches() []SessionBranch {
+	// Roots are children of "", which no entry ID is.
+	children := map[string][]SessionEntry{}
+	for _, e := range st.entries {
+		parent := ""
+		if p := e.GetBase().ParentID; p != nil && *p != e.GetBase().ID && st.byID[*p] != nil {
+			parent = *p
+		}
+		children[parent] = append(children[parent], e)
 	}
-	s.leafID = &id
-	return nil
+
+	var branches []SessionBranch
+	stack := slices.Clone(children[""])
+	slices.Reverse(stack)
+	for len(stack) > 0 {
+		e := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		id := e.GetBase().ID
+		if next := children[id]; len(next) > 0 {
+			next = slices.Clone(next)
+			slices.Reverse(next)
+			stack = append(stack, next...)
+			continue
+		}
+		branches = append(branches, st.branch(st.path(&id), children))
+	}
+	return branches
 }
 
-func (s *SessionManager) ResetLeaf() { s.leafID = nil }
-
-/*
-func (s *SessionManager) BranchWithSummary(ctx context.Context, from *string, summary string, details any, fromHook *bool) (string, error) {
-	if from != nil {
-		if _, ok := s.byID[*from]; !ok {
-			return "", errors.New("entry not found")
+// branch describes the branch ending at the last entry of path.
+func (st *sessionState) branch(path []SessionEntry, children map[string][]SessionEntry) SessionBranch {
+	start := 0
+	for i := len(path) - 1; i > 0; i-- {
+		if len(children[path[i-1].GetBase().ID]) > 1 {
+			start = i
+			break
 		}
 	}
-	s.leafID = from
-	fid := "root"
-	if from != nil {
-		fid = *from
+	own := path[start:]
+	branch := SessionBranch{
+		LeafID:       path[len(path)-1].GetBase().ID,
+		FirstEntryID: own[0].GetBase().ID,
 	}
-	e := &BranchSummaryEntry{s.base("branch_summary"), fid, summary, details, fromHook}
-	e.ParentID = from
-	if err := s.appendEntry(ctx, e); err != nil {
-		return "", err
+	if start > 0 {
+		branch.BranchPointID = &path[start-1].GetBase().ID
 	}
-	return e.ID, nil
+	for i := len(own) - 1; i >= 0 && branch.Label == nil; i-- {
+		if label, ok := st.labelsByID[own[i].GetBase().ID]; ok {
+			branch.Label = &label
+		}
+	}
+	for _, e := range own {
+		if st.leafID != nil && e.GetBase().ID == *st.leafID {
+			branch.Active = true
+		}
+		if branch.FirstMessage == "" {
+			branch.FirstMessage = entryUserText(e)
+		}
+	}
+	for i := start - 1; i >= 0 && branch.FirstMessage == ""; i-- {
+		branch.FirstMessage = entryUserText(path[i])
+	}
+	return branch
 }
-*/
 
-func InMemorySessionManager(ctx context.Context) (*SessionManager, error) {
-	sm, err := NewSessionManager(ctx, nil, nil, false, nil, nil)
+func entryUserText(e SessionEntry) string {
+	if m, ok := e.(*SessionMessageEntry); ok {
+		if user, ok := m.Message.(ai.UserMessage); ok {
+			return UserMessageText(user)
+		}
+	}
+	return ""
+}
+
+// ============================================================================
+// Branching and Forking
+// ============================================================================
+
+// SetLeaf moves the current position to an existing entry, so the next append
+// starts a branch from it. A persistent session saves the position first.
+func (s *SessionManager) SetLeaf(ctx context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.setLeaf(ctx, &id)
+}
+
+// ResetLeaf moves the current position before the first entry, so the next
+// append starts a new root.
+func (s *SessionManager) ResetLeaf(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.setLeaf(ctx, nil)
+}
+
+// BranchWithSummary moves the current position to from, or before the first
+// entry when from is nil, and appends a summary there of the branch being left.
+func (s *SessionManager) BranchWithSummary(ctx context.Context, from *string, summary string, details any, fromHook *bool) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.branchWithSummary(ctx, from, summary, details, fromHook)
+}
+
+// Fork creates a new session from the path from the root to leafID, which then
+// continues independently of this one. The entries keep their IDs. Labels on
+// the path are carried over as new label entries after it, keeping their
+// timestamps. A nil leafID forks from the root, giving a session with no
+// entries. The fork is saved through this manager's store when persisted.
+func (s *SessionManager) Fork(ctx context.Context, leafID *string) (*SessionManager, error) {
+	s.mu.RLock()
+	forked, err := s.state.fork(leafID)
+	s.mu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
-	return sm, nil
-}
-
-func (s *SessionManager) CreateBranchedSession(ctx context.Context, leafID string) (*SessionManager, error) {
-	path := s.GetBranch(leafID)
-	if len(path) == 0 {
-		return nil, errors.New("leaf session not found")
-	}
-
-	if s.persist && s.Store == nil {
-		return nil, errors.New("cannot persist session: Store is nil")
-	}
-
-	parentSessionID := s.sessionID
-	id, ts := createSessionID(), nowISO()
-
-	metadata := map[string]any(nil)
-	if s.Header.Metadata != nil {
-		metadata = make(map[string]any, len(s.Header.Metadata))
-		for k, v := range s.Header.Metadata {
-			metadata[k] = v
-		}
-	}
-
-	newHeader := &SessionHeader{
-		Type:          "session",
-		Version:       CurrentSessionVersion,
-		ID:            id,
-		Timestamp:     ts,
-		ParentSession: &parentSessionID,
-		Name:          s.Header.Name,
-		MessageCount:  0,
-		FirstMessage:  s.Header.FirstMessage,
-		Metadata:      metadata,
-	}
-
-	entries := make([]SessionEntry, 0, len(path))
-	var lastKeptID *string
-
-	for _, e := range path {
-		base := e.GetBase()
-
-		// Skip labels, but re-parent following entries so the branch chain remains valid.
-		if base.Type == "label" {
-			continue
-		}
-
-		cloned := cloneSessionEntry(e)
-		cloned.GetBase().ParentID = lastKeptID
-
-		entries = append(entries, cloned)
-
-		idCopy := cloned.GetBase().ID
-		lastKeptID = &idCopy
-
-		if _, ok := cloned.(*SessionMessageEntry); ok {
-			newHeader.MessageCount++
-		}
-	}
-
-	if s.persist {
-		if err := s.Store.CreateBranch(ctx, leafID, *newHeader); err != nil {
+	// The fork is a new session, so this one need not stay locked while it
+	// is saved.
+	if forked.persist {
+		if err := forked.store.CreateSession(ctx, *forked.header, forked.entries); err != nil {
 			return nil, err
 		}
 	}
+	return &SessionManager{state: forked}, nil
+}
 
-	branched := &SessionManager{
-		sessionID: id,
-		persist:   s.persist,
-		Header:    newHeader,
-		Entries:   entries,
-		Store:     s.Store,
+// setLeaf moves the current position to id, which must be an entry or nil.
+func (st *sessionState) setLeaf(ctx context.Context, id *string) error {
+	if id != nil && st.byID[*id] == nil {
+		return fmt.Errorf("entry %q not found", *id)
+	}
+	if st.persist {
+		if st.store == nil {
+			return errStoreRequired
+		}
+		if err := st.store.SetCurrentEntry(ctx, st.sessionID, st.leafID, id); err != nil {
+			return err
+		}
+	}
+	st.leafID = id
+	return nil
+}
+
+func (st *sessionState) branchWithSummary(ctx context.Context, from *string, summary string, details any, fromHook *bool) (string, error) {
+	fromID := "root"
+	if from != nil {
+		fromID = *from
+	}
+	if err := st.setLeaf(ctx, from); err != nil {
+		return "", err
+	}
+	return st.append(ctx, EntryTypeBranchSummary, func(b SessionEntryBase) SessionEntry {
+		return &BranchSummaryEntry{b, fromID, summary, details, fromHook}
+	})
+}
+
+// fork builds the state of a fork from leafID without saving it.
+func (st *sessionState) fork(leafID *string) (sessionState, error) {
+	if st.persist && st.store == nil {
+		return sessionState{}, errStoreRequired
+	}
+	var path []SessionEntry
+	if leafID != nil {
+		if st.byID[*leafID] == nil {
+			return sessionState{}, fmt.Errorf("entry %q not found", *leafID)
+		}
+		path = st.path(leafID)
+	}
+	parentSession := st.sessionID
+	header := SessionHeader{ParentSession: &parentSession, Metadata: maps.Clone(st.header.Metadata)}
+	if st.header.Name != nil {
+		name := *st.header.Name
+		header.Name = &name
 	}
 
-	branched.buildIndex()
+	entries := make([]SessionEntry, 0, len(path))
+	var lastID *string
+	var labeled []string
+	for _, e := range path {
+		// Labels are re-added below from the current label of each entry, so
+		// skip them and re-parent the entries after them.
+		if _, ok := e.(*LabelEntry); ok {
+			continue
+		}
+		cloned := cloneSessionEntry(e)
+		cloned.GetBase().ParentID = lastID
+		entries = append(entries, cloned)
+		lastID = &cloned.GetBase().ID
+		if _, ok := st.labelsByID[cloned.GetBase().ID]; ok {
+			labeled = append(labeled, cloned.GetBase().ID)
+		}
+	}
+	for _, target := range labeled {
+		label := st.labelsByID[target]
+		e := &LabelEntry{
+			SessionEntryBase: SessionEntryBase{Type: EntryTypeLabel, ID: generateID(), ParentID: lastID, Timestamp: st.labelTimestampsByID[target]},
+			TargetID:         target,
+			Label:            &label,
+		}
+		entries = append(entries, e)
+		lastID = &e.ID
+	}
 
-	return branched, nil
+	h := completeHeader(&header, nil)
+	forked := sessionState{persist: st.persist, store: st.store}
+	forked.reset(h.ID, h, entries, lastID)
+	return forked, nil
 }
 
 func cloneSessionEntry(e SessionEntry) SessionEntry {
@@ -746,134 +973,3 @@ func parseMillis(s string) int64 {
 	}
 	return 0
 }
-
-/*
- * TODO: reimplement this logic on the session store
- *
-func parseFileEntry(b []byte) (FileEntry, error) {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, err
-	}
-	var typ string
-	_ = json.Unmarshal(m["type"], &typ)
-	switch typ {
-	case "session":
-		var h SessionHeader
-		return &h, json.Unmarshal(b, &h)
-	case "message":
-		var e SessionMessageEntry
-		if err := unmarshalBase(b, &e.SessionEntryBase); err != nil {
-			return nil, err
-		}
-		e.Message = parseAgentMessage(m["message"])
-		return &e, nil
-	case "thinking_level_change":
-		var e ThinkingLevelChangeEntry
-		return &e, json.Unmarshal(b, &e)
-	case "model_change":
-		var e ModelChangeEntry
-		return &e, json.Unmarshal(b, &e)
-	case "compaction":
-		var e CompactionEntry
-		return &e, json.Unmarshal(b, &e)
-	case "branch_summary":
-		var e BranchSummaryEntry
-		return &e, json.Unmarshal(b, &e)
-	case "custom":
-		var e CustomEntry
-		return &e, json.Unmarshal(b, &e)
-	case "custom_message":
-		var e CustomMessageEntry
-		unmarshalBase(b, &e.SessionEntryBase)
-		var tmp struct {
-			CustomType string
-			Content    json.RawMessage
-			Details    any
-			Display    bool
-		}
-		_ = json.Unmarshal(b, &tmp)
-		e.CustomType = tmp.CustomType
-		e.Content = parseUserContents(tmp.Content)
-		e.Details = tmp.Details
-		e.Display = tmp.Display
-		return &e, nil
-	case "label":
-		var e LabelEntry
-		return &e, json.Unmarshal(b, &e)
-	case "session_info":
-		var e SessionInfoEntry
-		return &e, json.Unmarshal(b, &e)
-	}
-	return nil, errors.New("unknown entry")
-}
-
-func unmarshalBase(b []byte, base *SessionEntryBase) error { return json.Unmarshal(b, base) }
-
-func parseAgentMessage(b json.RawMessage) agent.AgentMessage {
-	var h struct {
-		Role string `json:"role"`
-	}
-	_ = json.Unmarshal(b, &h)
-	switch h.Role {
-	case "user":
-		var tmp struct {
-			Role      ai.Role
-			Content   json.RawMessage
-			Timestamp int64
-		}
-		_ = json.Unmarshal(b, &tmp)
-		return ai.UserMessage{Role: tmp.Role, Content: parseUserContents(tmp.Content), Timestamp: tmp.Timestamp}
-	case "assistant":
-		var m ai.AssistantMessage
-		_ = json.Unmarshal(b, &m)
-		return m
-	case "toolResult":
-		var m ai.ToolResultMessage
-		_ = json.Unmarshal(b, &m)
-		return m
-	case MessageRoleCustom:
-		var m CustomMessage
-		_ = json.Unmarshal(b, &m)
-		return m
-	case MessageRoleBranchSummary:
-		var m BranchSummaryMessage
-		_ = json.Unmarshal(b, &m)
-		return m
-	case MessageRoleCompactionSummary:
-		var m CompactionSummaryMessage
-		_ = json.Unmarshal(b, &m)
-		return m
-	}
-	return nil
-}
-
-func parseUserContents(b json.RawMessage) []ai.UserContent {
-	if len(b) == 0 {
-		return nil
-	}
-	if b[0] == '"' {
-		var s string
-		_ = json.Unmarshal(b, &s)
-		return []ai.UserContent{ai.TextContent{Type: ai.ContentTypeText, Text: s}}
-	}
-	var raws []json.RawMessage
-	_ = json.Unmarshal(b, &raws)
-	out := []ai.UserContent{}
-	for _, r := range raws {
-		var h struct{ Type ai.ContentType }
-		_ = json.Unmarshal(r, &h)
-		if h.Type == ai.ContentTypeImage {
-			var x ai.ImageContent
-			_ = json.Unmarshal(r, &x)
-			out = append(out, x)
-		} else {
-			var x ai.TextContent
-			_ = json.Unmarshal(r, &x)
-			out = append(out, x)
-		}
-	}
-	return out
-}
-
-*/

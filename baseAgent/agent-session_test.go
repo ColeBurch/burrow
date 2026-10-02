@@ -20,28 +20,24 @@ type appendErrorSessionStore struct {
 	appendErr error
 }
 
-func (*appendErrorSessionStore) CreateSession(context.Context, *SessionHeader) error {
+func (*appendErrorSessionStore) CreateSession(context.Context, SessionHeader, []SessionEntry) error {
 	return nil
 }
 
-func (*appendErrorSessionStore) LoadSession(context.Context, string) (*SessionHeader, []SessionEntry, error) {
+func (*appendErrorSessionStore) LoadSession(context.Context, string) (LoadedSession, error) {
 	panic("unexpected LoadSession call")
 }
 
-func (s *appendErrorSessionStore) AppendEntry(context.Context, *SessionHeader, SessionEntry) error {
+func (s *appendErrorSessionStore) AppendEntry(context.Context, string, SessionEntry) error {
 	return s.appendErr
 }
 
-func (*appendErrorSessionStore) ListSessions(context.Context, map[string]any) ([]SessionInfo, error) {
+func (*appendErrorSessionStore) SetCurrentEntry(context.Context, string, *string, *string) error {
+	panic("unexpected SetCurrentEntry call")
+}
+
+func (*appendErrorSessionStore) ListSessions(context.Context, SessionQuery) ([]SessionInfo, error) {
 	panic("unexpected ListSessions call")
-}
-
-func (*appendErrorSessionStore) FindMostRecentSession(context.Context, map[string]any) (*SessionInfo, error) {
-	panic("unexpected FindMostRecentSession call")
-}
-
-func (*appendErrorSessionStore) CreateBranch(context.Context, string, SessionHeader) error {
-	panic("unexpected CreateBranch call")
 }
 
 func TestAgentSessionPromptReturnsSessionStoreError(t *testing.T) {
@@ -77,7 +73,7 @@ type contextSessionStore struct {
 	hadDeadline bool
 }
 
-func (s *contextSessionStore) AppendEntry(ctx context.Context, _ *SessionHeader, entry SessionEntry) error {
+func (s *contextSessionStore) AppendEntry(ctx context.Context, _ string, entry SessionEntry) error {
 	_, hasDeadline := ctx.Deadline()
 	s.mu.Lock()
 	s.hadDeadline = s.hadDeadline || hasDeadline
@@ -537,8 +533,11 @@ func TestAgentSessionManualCompactionRestoresQueuedMessages(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("active agent run did not start")
 	}
-	if err := session.Prompt(ctx, "follow-up", &PromptOptions{StreamingBehavior: StreamingBehaviorFollowUp}); err != nil {
-		t.Fatal(err)
+	// Queue modes do not apply: every queued message comes back, steering first.
+	for _, text := range []string{"follow-up 1", "follow-up 2"} {
+		if err := session.Prompt(ctx, text, &PromptOptions{StreamingBehavior: StreamingBehaviorFollowUp}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := session.Prompt(ctx, "steer", &PromptOptions{StreamingBehavior: StreamingBehaviorSteer}); err != nil {
 		t.Fatal(err)
@@ -560,7 +559,7 @@ func TestAgentSessionManualCompactionRestoresQueuedMessages(t *testing.T) {
 	for _, message := range ends[0].RestoredMessages {
 		restored = append(restored, userText(t, message))
 	}
-	if want := []string{"steer", "follow-up"}; !reflect.DeepEqual(restored, want) {
+	if want := []string{"steer", "follow-up 1", "follow-up 2"}; !reflect.DeepEqual(restored, want) {
 		t.Errorf("restored messages = %q, want %q", restored, want)
 	}
 	if a.HasQueuedMessages() {
@@ -2069,8 +2068,8 @@ func TestAgentSessionEventsForwardToolEvents(t *testing.T) {
 func TestAgentSessionEventsDoNotSwallowPromptPersistenceError(t *testing.T) {
 	h := newAutoCompactionHarness(t, false)
 	failure := errors.New("ordinary message persistence failed")
-	h.session.SessionManager.persist = true
-	h.session.SessionManager.Store = &appendErrorSessionStore{appendErr: failure}
+	h.session.SessionManager.state.persist = true
+	h.session.SessionManager.state.store = &appendErrorSessionStore{appendErr: failure}
 	log, unsubscribe := recordSessionEvents(h)
 	defer unsubscribe()
 	initialEntries := len(h.session.SessionManager.GetEntries())
@@ -2401,7 +2400,7 @@ func TestAgentSessionEventsOverflowRetry(t *testing.T) {
 // Fail only compaction persistence, allowing the triggering prompt to complete.
 type sessionEventCompactionErrorStore struct{ appendErrorSessionStore }
 
-func (s *sessionEventCompactionErrorStore) AppendEntry(_ context.Context, _ *SessionHeader, entry SessionEntry) error {
+func (s *sessionEventCompactionErrorStore) AppendEntry(_ context.Context, _ string, entry SessionEntry) error {
 	if _, ok := entry.(*CompactionEntry); ok {
 		return s.appendErr
 	}
@@ -2423,8 +2422,8 @@ func TestAgentSessionEventsCompactionFailureAndCancellation(t *testing.T) {
 					})
 				}
 				if method == "persistence_error" {
-					h.session.SessionManager.persist = true
-					h.session.SessionManager.Store = &sessionEventCompactionErrorStore{appendErrorSessionStore{appendErr: failure}}
+					h.session.SessionManager.state.persist = true
+					h.session.SessionManager.state.store = &sessionEventCompactionErrorStore{appendErrorSessionStore{appendErr: failure}}
 				}
 				response := h.response(950, ai.StopReasonStop)
 				if reason == CompactionReasonOverflow {

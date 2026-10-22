@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"testing"
@@ -260,6 +261,35 @@ func TestStreamOpenAIResponseNilOptionsReturnsSetupError(t *testing.T) {
 	_, err := StreamOpenAIResponse(context.Background(), testResponsesModel(), ModelContext{}, nil)
 	if err == nil || err.Error() != "options are required" {
 		t.Fatalf("err = %v, want options are required", err)
+	}
+}
+
+// Invalid options fail before any request work, so OnPayload never sees a
+// payload that will not be sent.
+func TestStreamOpenAIResponseRejectsInvalidOptionsBeforeOnPayload(t *testing.T) {
+	ms := func(v int64) *int64 { return &v }
+	for name, options := range map[string]StreamOptions{
+		"negative MaxRetries":        {MaxRetries: ms(-1)},
+		"negative TimeoutMs":         {TimeoutMs: ms(-1)},
+		"negative MaxRetriesDelayMs": {MaxRetriesDelayMs: ms(-1)},
+		"TimeoutMs too large":        {TimeoutMs: ms(math.MaxInt64)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			apiKey := "test-key"
+			payloads := 0
+			options.ApiKey = &apiKey
+			options.OnPayload = func(any, Model[API]) (any, error) {
+				payloads++
+				return nil, nil
+			}
+			_, err := StreamOpenAIResponse(context.Background(), testResponsesModel(), ModelContext{}, &OpenAIResponseOptions{StreamOptions: options})
+			if err == nil {
+				t.Fatal("StreamOpenAIResponse succeeded, want a setup error")
+			}
+			if payloads != 0 {
+				t.Errorf("OnPayload ran %d times for a request that is never sent", payloads)
+			}
+		})
 	}
 }
 
@@ -726,4 +756,56 @@ func TestStreamOpenAIResponseLive(t *testing.T) {
 		t.Fatal("expected assistant content")
 	}
 	t.Logf("final message: %+v", msg)
+}
+
+// An assistant message can hold several text blocks without signatures, such
+// as one from another provider with text around a tool call. Each becomes an
+// output message item, and the items need distinct IDs.
+func TestConvertResponsesMessagesGivesUnsignedTextUniqueIDs(t *testing.T) {
+	model := testResponsesModel()
+	text := func(s string) TextContent { return TextContent{Type: ContentTypeText, Text: s} }
+	signature := EncodeTextSignatureV1("msg_api", nil)
+	signed := text("signed")
+	signed.TextSignature = &signature
+	messages := []Message{
+		AssistantMessage{
+			Role: RoleAssistant, Api: "anthropic-messages", Provider: "anthropic", Model: "claude-test",
+			Content: []AssistantContent{
+				text("first"),
+				ToolCall{Type: ContentTypeToolCall, Id: "toolu_1", Name: "lookup", Args: map[string]any{}},
+				text("second"),
+			},
+			StopReason: StopReasonToolUse,
+		},
+		ToolResultMessage{Role: RoleToolResult, ToolCallID: "toolu_1", ToolName: "lookup", Content: []ToolResultContent{text("result")}},
+		AssistantMessage{
+			Role: RoleAssistant, Api: model.API, Provider: model.Provider, Model: model.ID,
+			Content:    []AssistantContent{text("third"), signed},
+			StopReason: StopReasonStop,
+		},
+	}
+
+	items, err := ConvertResponsesMessages(model, ModelContext{Messages: messages}, OpenAIToolCallProviders, ConvertResponseMessagesOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	seen := map[string]bool{}
+	for _, item := range items {
+		if item.OfOutputMessage == nil {
+			continue
+		}
+		id := item.OfOutputMessage.ID
+		if seen[id] {
+			t.Errorf("output message ID %q is used more than once", id)
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	if len(ids) != 4 {
+		t.Fatalf("got output message IDs %q, want 4", ids)
+	}
+	if ids[3] != "msg_api" {
+		t.Errorf("signed text ID = %q, want its signature's msg_api", ids[3])
+	}
 }

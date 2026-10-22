@@ -94,3 +94,40 @@ func TestTransformMessagesDoesNotPanicOnNonToolAssistantContentWhenFindingToolCa
 		t.Fatalf("got[2] = %T, want UserMessage", got[2])
 	}
 }
+
+func TestTransformMessagesTextSignature(t *testing.T) {
+	model := testTransformModel()
+	other := model
+	other.ID = "gpt-other"
+	signature := EncodeTextSignatureV1("msg_1", nil)
+	tests := []struct {
+		name          string
+		replyFrom     Model[API]
+		wantSignature *string
+	}{
+		{name: "same model keeps it", replyFrom: model, wantSignature: &signature},
+		{name: "different model drops it", replyFrom: other},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			messages := []Message{AssistantMessage{
+				Role:       RoleAssistant,
+				Api:        tt.replyFrom.API,
+				Provider:   tt.replyFrom.Provider,
+				Model:      tt.replyFrom.ID,
+				Content:    []AssistantContent{TextContent{Type: ContentTypeText, Text: "hi", TextSignature: &signature}},
+				StopReason: StopReasonStop,
+			}}
+
+			got := TransformMessages(messages, model, nil)
+			text := got[0].(AssistantMessage).Content[0].(TextContent)
+			if text.Text != "hi" {
+				t.Errorf("text = %q, want hi", text.Text)
+			}
+			if (text.TextSignature == nil) != (tt.wantSignature == nil) ||
+				(text.TextSignature != nil && *text.TextSignature != *tt.wantSignature) {
+				t.Errorf("TextSignature = %v, want %v", text.TextSignature, tt.wantSignature)
+			}
+		})
+	}
+}

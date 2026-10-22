@@ -2,6 +2,7 @@ package ai
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/govalues/decimal"
 )
@@ -341,6 +342,16 @@ type ProviderResponse struct {
 	Headers map[string]string `json:"headers"`
 }
 
+// StreamOptions configures one model request.
+//
+// TimeoutMs bounds how long each attempt waits for the response to start; it
+// does not limit a stream that has started. Nil means DefaultTimeout (10
+// minutes). MaxRetries is how many times a failed request is retried; nil means
+// DefaultMaxRetries (2). MaxRetriesDelayMs fails a request at once, instead of
+// retrying, when the server asks for a longer retry delay. Nil means
+// DefaultMaxRetriesDelay (60 seconds). Zero TimeoutMs or MaxRetriesDelayMs
+// means no limit. Negative values are an error, as are durations over about
+// 292 years, the most a time.Duration can hold.
 type StreamOptions struct {
 	Temperature       *decimal.Decimal                                        `json:"temperature,omitempty"`
 	MaxTokens         *int64                                                  `json:"max_tokens,omitempty"`
@@ -355,6 +366,7 @@ type StreamOptions struct {
 	TimeoutMs         *int64                                                  `json:"timeout_ms,omitempty"`
 	MaxRetries        *int64                                                  `json:"max_retries,omitempty"`
 	MaxRetriesDelayMs *int64                                                  `json:"max_retries_delay_ms,omitempty"`
+	HTTPClient        *http.Client                                            `json:"-"`
 	Metadata          map[string]any                                          `json:"metadata,omitempty"`
 }
 

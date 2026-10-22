@@ -144,6 +144,12 @@ func TransformMessages(messages []Message, model Model[API], allowedToolCallProv
 					}
 
 				case TextContent:
+					// The signature holds the provider's item ID and phase, which
+					// only mean something to the model that produced them.
+					if isSameModel {
+						newContent = append(newContent, block)
+						continue
+					}
 					newContent = append(newContent, TextContent{
 						Type: ContentTypeText,
 						Text: block.(TextContent).Text,

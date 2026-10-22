@@ -3,12 +3,12 @@ module github.com/ColeBurch/burrow/agent
 go 1.27.3
 
 require (
-	github.com/ColeBurch/burrow/ai v0.4.0
+	github.com/ColeBurch/burrow/ai v0.5.0
 	github.com/govalues/decimal v0.1.36
+	github.com/openai/openai-go/v3 v3.35.0
 )
 
 require (
-	github.com/openai/openai-go/v3 v3.35.0 // indirect
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect

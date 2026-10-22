@@ -31,11 +31,13 @@ var OpenAIToolCallProviders = map[Provider]struct{}{
 	ProviderOpenAI: {},
 }
 
+// ResolveCacheRetention returns cacheRetention, or CacheRetentionShort when it
+// is unset. CacheRetentionNone is kept, so callers can turn caching off.
 func ResolveCacheRetention(cacheRetention CacheRetention) CacheRetention {
-	if cacheRetention != "" && cacheRetention != CacheRetentionNone {
-		return cacheRetention
+	if cacheRetention == "" {
+		return CacheRetentionShort
 	}
-	return CacheRetentionShort
+	return cacheRetention
 }
 
 type ResolvedOpenAIResponsesCompat struct {
@@ -190,6 +192,12 @@ func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext Mo
 	if options == nil {
 		return nil, fmt.Errorf("options are required")
 	}
+	// Validate before any request work, so hooks never see a request that is
+	// not sent.
+	policy, err := newRetryPolicy(options.StreamOptions)
+	if err != nil {
+		return nil, err
+	}
 	apiKey := options.ApiKey
 	if apiKey == nil {
 		return nil, fmt.Errorf("apiKey is required")
@@ -230,7 +238,12 @@ func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext Mo
 	}
 
 	requestOptions := []option.RequestOption{}
-
+	if options.HTTPClient != nil {
+		requestOptions = append(requestOptions, option.WithHTTPClient(options.HTTPClient))
+	}
+	// The retry policy replaces the SDK's retries. Middlewares run outermost
+	// first, so OnResponse sees only the final response, as in pi-mono.
+	requestOptions = append(requestOptions, option.WithMaxRetries(0))
 	if options.OnResponse != nil {
 		requestOptions = append(requestOptions, option.WithMiddleware(
 			func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
@@ -252,6 +265,11 @@ func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext Mo
 			},
 		))
 	}
+	requestOptions = append(requestOptions, option.WithMiddleware(
+		func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+			return policy.do(req, next)
+		},
+	))
 
 	openaiStream := client.Responses.NewStreaming(ctx, params, requestOptions...)
 
@@ -264,6 +282,7 @@ func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext Mo
 	processor.stream.Push(StartEvent{Type: "start", Partial: output})
 
 	go func() {
+		defer openaiStream.Close()
 		sentTerminalEvent := false
 		for openaiStream.Next() {
 			event := openaiStream.Current()
@@ -279,6 +298,11 @@ func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext Mo
 		}
 
 		if !sentTerminalEvent {
+			// Cancellation can end the response body cleanly, with no read error.
+			if err := ctx.Err(); err != nil {
+				pushOpenAIResponsesStreamError(ctx, stream, &output, err)
+				return
+			}
 			pushAssistantStreamError(stream, &output, StopReasonError, "OpenAI stream ended without terminal event")
 		}
 	}()
@@ -473,7 +497,7 @@ func ConvertResponsesMessages(model Model[API], modelContext ModelContext, provi
 		includeSystemPromt = *options.IncludeSystemPrompt
 	}
 
-	if modelContext.SystemPrompt != nil && includeSystemPromt {
+	if modelContext.SystemPrompt != nil && *modelContext.SystemPrompt != "" && includeSystemPromt {
 		if model.Reasoning {
 			messages = append(messages, responses.ResponseInputItemParamOfMessage(*modelContext.SystemPrompt, responses.EasyInputMessageRoleDeveloper))
 		} else {
@@ -503,7 +527,7 @@ func ConvertResponsesMessages(model Model[API], modelContext ModelContext, provi
 			messages = append(messages, responses.ResponseInputItemParamOfMessage(content, responses.EasyInputMessageRoleUser))
 		case AssistantMessage:
 			isDifferentModel := m.Model != model.ID && m.Provider == model.Provider && m.Api == model.API
-			for _, part := range m.Content {
+			for j, part := range m.Content {
 				switch p := part.(type) {
 				case TextContent:
 					parsedSignature := ParseTextSignature(p.TextSignature)
@@ -512,7 +536,10 @@ func ConvertResponsesMessages(model Model[API], modelContext ModelContext, provi
 						msgID = parsedSignature.ID
 					}
 					if msgID == "" {
-						msgID = fmt.Sprintf("msg_%d", i)
+						// A message can hold several unsigned text blocks, such as
+						// one from another provider with text around a tool call,
+						// so the block index keeps their IDs distinct.
+						msgID = fmt.Sprintf("msg_%d_%d", i, j)
 					} else if len(msgID) > 64 {
 						msgID = fmt.Sprintf("msg_%s", shortHash(msgID))
 					}

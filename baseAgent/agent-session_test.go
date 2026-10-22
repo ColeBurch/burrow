@@ -1,3 +1,5 @@
+// Adapted from pi's packages/coding-agent/test/agent-session-auto-compaction-queue.test.ts and packages/coding-agent/test/suite/agent-session-compaction.test.ts (MIT, see LICENSE).
+
 package baseAgent
 
 import (

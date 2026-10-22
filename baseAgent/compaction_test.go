@@ -1,3 +1,5 @@
+// Adapted from pi's packages/coding-agent/test/compaction.test.ts and packages/coding-agent/test/compaction-serialization.test.ts (MIT, see LICENSE).
+
 package baseAgent
 
 import (

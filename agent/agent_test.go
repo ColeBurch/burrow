@@ -1,3 +1,5 @@
+// Ported from pi's packages/agent/test/agent.test.ts (MIT, see LICENSE).
+
 package agent
 
 import (

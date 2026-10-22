@@ -1,3 +1,5 @@
+// Ported from pi's packages/agent/src/agent-loop.ts (MIT, see LICENSE).
+
 package agent
 
 import (

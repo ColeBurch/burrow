@@ -1,3 +1,5 @@
+// Ported from pi's packages/ai/src/utils/overflow.ts (MIT, see LICENSE).
+
 package ai
 
 import "regexp"

@@ -1,3 +1,5 @@
+// Adapted from pi's packages/coding-agent/src/core/compaction/compaction.ts and packages/coding-agent/src/core/compaction/utils.ts (MIT, see LICENSE).
+
 package baseAgent
 
 import (

@@ -1,3 +1,5 @@
+// Ported from pi's packages/ai/test/validation.test.ts (MIT, see LICENSE).
+
 package ai
 
 import (

@@ -1,3 +1,5 @@
+// Ported from pi's packages/coding-agent/src/core/messages.ts (MIT, see LICENSE).
+
 package baseAgent
 
 import (

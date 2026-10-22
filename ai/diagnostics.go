@@ -1,3 +1,5 @@
+// Ported from pi's packages/ai/src/utils/diagnostics.ts (MIT, see LICENSE).
+
 package ai
 
 type DiagnosticErrorInfo struct {

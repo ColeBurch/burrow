@@ -1,3 +1,5 @@
+// Ported from pi's packages/ai/src/models.ts (MIT, see LICENSE).
+
 package ai
 
 import (

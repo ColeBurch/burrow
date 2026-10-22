@@ -1,3 +1,5 @@
+// Adapted from pi's packages/ai/src/providers/transform-messages.ts and packages/ai/src/providers/openai-responses-shared.ts (MIT, see LICENSE).
+
 package ai
 
 import (

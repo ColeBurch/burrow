@@ -1,3 +1,5 @@
+// Adapted from pi's packages/agent/src/agent.ts (MIT, see LICENSE).
+
 package agent
 
 import (

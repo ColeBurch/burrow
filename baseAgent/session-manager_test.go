@@ -1,3 +1,5 @@
+// Adapted from pi's packages/coding-agent/test/session-manager/build-context.test.ts (MIT, see LICENSE).
+
 package baseAgent
 
 import (

@@ -1,3 +1,5 @@
+// Adapted from pi's packages/ai/scripts/generate-models.ts (MIT, see LICENSE).
+
 //go:build ignore
 
 // Generate OpenAI model metadata from models.dev.

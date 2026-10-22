@@ -1,3 +1,5 @@
+// Adapted from pi's packages/coding-agent/src/core/agent-session.ts (MIT, see LICENSE).
+
 package baseAgent
 
 import (

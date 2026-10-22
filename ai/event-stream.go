@@ -1,3 +1,5 @@
+// Ported from pi's packages/ai/src/utils/event-stream.ts (MIT, see LICENSE).
+
 package ai
 
 import (

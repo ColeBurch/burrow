@@ -1,3 +1,5 @@
+// Adapted from pi's packages/ai/test/overflow.test.ts (MIT, see LICENSE).
+
 package ai
 
 import (

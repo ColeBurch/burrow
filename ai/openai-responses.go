@@ -1,3 +1,5 @@
+// Adapted from pi's packages/ai/src/providers/openai-responses.ts, packages/ai/src/providers/openai-responses-shared.ts and packages/ai/src/providers/simple-options.ts (MIT, see LICENSE).
+
 package ai
 
 import (

@@ -7,20 +7,14 @@ import (
 	"slices"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/ColeBurch/burrow/ai"
-	"github.com/google/uuid"
 )
 
 const agentStreamBuffer = 64
 
-func newMessageID() string {
-	id, err := uuid.NewV7()
-	if err != nil {
-		return uuid.NewString()
-	}
-	return id.String()
-}
+func newMessageID() string { return uuid.NewV7().String() }
 
 type AgentEventSink func(event AgentEvent) error
 

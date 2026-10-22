@@ -9,10 +9,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/ColeBurch/burrow/agent"
 	"github.com/ColeBurch/burrow/ai"
-	"github.com/google/uuid"
 )
 
 const CurrentSessionVersion = 1
@@ -190,15 +190,9 @@ type SessionBranch struct {
 
 var errStoreRequired = errors.New("store required for persistent session")
 
-func createSessionID() string { return uuid.NewString() }
+func createSessionID() string { return uuid.New().String() }
 
-func generateID() string {
-	id, err := uuid.NewV7()
-	if err != nil {
-		return uuid.NewString()
-	}
-	return id.String()
-}
+func generateID() string { return uuid.NewV7().String() }
 
 func nowISO() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 

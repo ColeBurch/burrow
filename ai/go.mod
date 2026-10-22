@@ -1,6 +1,6 @@
 module github.com/ColeBurch/burrow/ai
 
-go 1.26.3
+go 1.27.3
 
 require (
 	github.com/govalues/decimal v0.1.36

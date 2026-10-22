@@ -18,10 +18,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/ColeBurch/burrow/ai"
 	"github.com/ColeBurch/burrow/baseAgent"
-	"github.com/google/uuid"
 	"github.com/govalues/decimal"
 )
 
@@ -56,7 +56,7 @@ func Run(t *testing.T, newStore func(t *testing.T) baseAgent.SessionStore) {
 			s := &suite{
 				ctx:   context.Background(),
 				store: newStore(t),
-				run:   uuid.NewString(),
+				run:   uuid.New().String(),
 				clock: time.Now().UTC().Truncate(time.Millisecond),
 			}
 			test.run(t, s)
@@ -80,7 +80,7 @@ func (s *suite) header(parent *string, metadata map[string]any) baseAgent.Sessio
 	return baseAgent.SessionHeader{
 		Type:          "session",
 		Version:       baseAgent.CurrentSessionVersion,
-		ID:            uuid.NewString(),
+		ID:            uuid.New().String(),
 		Timestamp:     time.Now().UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano),
 		ParentSession: parent,
 		Metadata:      all,
@@ -137,7 +137,7 @@ func (s *suite) list(t *testing.T, query baseAgent.SessionQuery) []baseAgent.Ses
 func ids(n int) []string {
 	out := make([]string, n)
 	for i := range out {
-		out[i] = uuid.NewString()
+		out[i] = uuid.New().String()
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(out)))
 	return out
@@ -306,7 +306,7 @@ func testForkKeepsEntryIDs(t *testing.T, s *suite) {
 		copied = append(copied, &original)
 	}
 	s.create(t, fork, copied...)
-	next := s.userEntry(uuid.NewString(), &copied[1].GetBase().ID, 3, "fork only")
+	next := s.userEntry(uuid.New().String(), &copied[1].GetBase().ID, 3, "fork only")
 	s.append(t, fork.ID, next)
 
 	forked := s.load(t, fork.ID)
@@ -349,17 +349,17 @@ func testAppendRetryAndConflict(t *testing.T, s *suite) {
 	header := s.header(nil, nil)
 	s.create(t, header)
 	entries := s.userChain(2)
-	if err := s.store.AppendEntry(s.ctx, header.ID, s.userEntry(uuid.NewString(), ptr(uuid.NewString()), 0, "unknown parent")); !errors.Is(err, baseAgent.ErrSessionConflict) {
+	if err := s.store.AppendEntry(s.ctx, header.ID, s.userEntry(uuid.New().String(), ptr(uuid.New().String()), 0, "unknown parent")); !errors.Is(err, baseAgent.ErrSessionConflict) {
 		t.Fatalf("AppendEntry(parent set, no position) error = %v, want ErrSessionConflict", err)
 	}
 	s.append(t, header.ID, entries...)
 	s.append(t, header.ID, entries[0])
 
-	stale := s.userEntry(uuid.NewString(), &entries[0].GetBase().ID, 2, "stale parent")
+	stale := s.userEntry(uuid.New().String(), &entries[0].GetBase().ID, 2, "stale parent")
 	if err := s.store.AppendEntry(s.ctx, header.ID, stale); !errors.Is(err, baseAgent.ErrSessionConflict) {
 		t.Fatalf("AppendEntry(stale parent) error = %v, want ErrSessionConflict", err)
 	}
-	root := s.userEntry(uuid.NewString(), nil, 2, "new root")
+	root := s.userEntry(uuid.New().String(), nil, 2, "new root")
 	if err := s.store.AppendEntry(s.ctx, header.ID, root); !errors.Is(err, baseAgent.ErrSessionConflict) {
 		t.Fatalf("AppendEntry(nil parent, position set) error = %v, want ErrSessionConflict", err)
 	}
@@ -377,7 +377,7 @@ func testConcurrentAppendsConflict(t *testing.T, s *suite) {
 	const writers = 8
 	candidates := make([]*baseAgent.SessionMessageEntry, writers)
 	for i := range candidates {
-		candidates[i] = s.userEntry(uuid.NewString(), &parent, i+1, "writer")
+		candidates[i] = s.userEntry(uuid.New().String(), &parent, i+1, "writer")
 	}
 	errs := make([]error, writers)
 	start := make(chan struct{})
@@ -425,7 +425,7 @@ func testSetCurrentEntry(t *testing.T, s *suite) {
 	if err := s.store.SetCurrentEntry(s.ctx, header.ID, nil, &first); !errors.Is(err, baseAgent.ErrSessionConflict) {
 		t.Fatalf("SetCurrentEntry(nil expected, position set) error = %v, want ErrSessionConflict", err)
 	}
-	if err := s.store.SetCurrentEntry(s.ctx, header.ID, &last, ptr(uuid.NewString())); err == nil {
+	if err := s.store.SetCurrentEntry(s.ctx, header.ID, &last, ptr(uuid.New().String())); err == nil {
 		t.Fatal("SetCurrentEntry(unknown entry) succeeded")
 	}
 	assertCurrent(t, s.load(t, header.ID), &last)
@@ -439,7 +439,7 @@ func testSetCurrentEntry(t *testing.T, s *suite) {
 }
 
 func testUnknownSession(t *testing.T, s *suite) {
-	missing := uuid.NewString()
+	missing := uuid.New().String()
 	if _, err := s.store.LoadSession(s.ctx, missing); !errors.Is(err, baseAgent.ErrSessionNotFound) {
 		t.Errorf("LoadSession() error = %v, want ErrSessionNotFound", err)
 	}
@@ -456,7 +456,7 @@ func testUnknownSession(t *testing.T, s *suite) {
 // ============================================================================
 
 func testSessionInfo(t *testing.T, s *suite) {
-	parent := uuid.NewString()
+	parent := uuid.New().String()
 	header := s.header(&parent, map[string]any{"user": "u-1"})
 	s.create(t, header)
 	id := ids(5)
@@ -500,7 +500,7 @@ func testSessionInfo(t *testing.T, s *suite) {
 
 	// Clearing the name leaves none, and every append moves Modified forward.
 	time.Sleep(modifiedGap)
-	cleared := &baseAgent.SessionInfoEntry{SessionEntryBase: baseAgent.SessionEntryBase{Type: baseAgent.EntryTypeSessionInfo, ID: uuid.NewString(), ParentID: &id[4], Timestamp: s.timestamp(5)}, Name: ptr("")}
+	cleared := &baseAgent.SessionInfoEntry{SessionEntryBase: baseAgent.SessionEntryBase{Type: baseAgent.EntryTypeSessionInfo, ID: uuid.New().String(), ParentID: &id[4], Timestamp: s.timestamp(5)}, Name: ptr("")}
 	s.append(t, header.ID, cleared)
 	updated := s.list(t, baseAgent.SessionQuery{})[0]
 	if updated.Name != nil {
@@ -523,7 +523,7 @@ func testListSessionsOrderLimitAndFilter(t *testing.T, s *suite) {
 		tips[header.ID] = &entry.GetBase().ID
 		time.Sleep(modifiedGap)
 	}
-	s.append(t, a.ID, s.userEntry(uuid.NewString(), tips[a.ID], 1, "latest"))
+	s.append(t, a.ID, s.userEntry(uuid.New().String(), tips[a.ID], 1, "latest"))
 
 	assertOrder := func(what string, infos []baseAgent.SessionInfo, want ...string) {
 		t.Helper()

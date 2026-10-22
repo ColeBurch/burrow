@@ -1,10 +1,9 @@
 module github.com/ColeBurch/burrow/agent
 
-go 1.26.3
+go 1.27.3
 
 require (
-	github.com/ColeBurch/burrow/ai v0.3.1
-	github.com/google/uuid v1.6.0
+	github.com/ColeBurch/burrow/ai v0.4.0
 	github.com/govalues/decimal v0.1.36
 )
 

@@ -1,11 +1,10 @@
 module github.com/ColeBurch/burrow/baseAgent
 
-go 1.26.3
+go 1.27.3
 
 require (
-	github.com/ColeBurch/burrow/agent v0.3.1
-	github.com/ColeBurch/burrow/ai v0.3.1
-	github.com/google/uuid v1.6.0
+	github.com/ColeBurch/burrow/agent v0.4.0
+	github.com/ColeBurch/burrow/ai v0.4.0
 	github.com/govalues/decimal v0.1.36
 	golang.org/x/sync v0.22.0
 )

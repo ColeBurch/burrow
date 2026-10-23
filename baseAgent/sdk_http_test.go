@@ -17,6 +17,7 @@ import (
 	"github.com/ColeBurch/burrow/ai/providertest"
 	"github.com/ColeBurch/burrow/ai/providertest/openairesponses"
 	"github.com/ColeBurch/burrow/baseAgent"
+	"github.com/ColeBurch/burrow/baseAgent/authstoretest"
 	"github.com/ColeBurch/burrow/baseAgent/sessionstoretest"
 )
 
@@ -31,13 +32,6 @@ import (
 // would.
 
 const httpSessionAPIKey = "test-key"
-
-// staticAuth is an AuthStore with one key for OpenAI.
-type staticAuth string
-
-func (a staticAuth) APIKey(provider ai.Provider) (string, bool) {
-	return string(a), provider == ai.ProviderOpenAI
-}
 
 type httpSessionHarness struct {
 	ctx    context.Context
@@ -60,8 +54,16 @@ func newHTTPSessionHarness(t *testing.T, base ai.Model[ai.API], handler http.Han
 	h := &httpSessionHarness{ctx: ctx, store: sessionstoretest.NewMemoryStore()}
 	h.server = providertest.NewServer(t, handler)
 	h.model = h.server.Route(t, base)
-	h.registry = baseAgent.NewModelRegistryWithModels(staticAuth(httpSessionAPIKey), map[ai.Provider]map[string]ai.Model[ai.API]{
-		h.model.Provider: {h.model.ID: h.model},
+	// The key is logged in to a user's credentials, as a multi-user app does.
+	credentials := baseAgent.ScopeAuthStore(authstoretest.NewMemoryStore(), "user-1")
+	if _, err := credentials.Modify(ctx, h.model.Provider, func(*ai.Credential) (*ai.Credential, error) {
+		return &ai.Credential{Type: ai.CredentialAPIKey, Key: httpSessionAPIKey}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.registry = baseAgent.NewModelRegistry(&baseAgent.ModelRegistryOptions{
+		Credentials: credentials,
+		Models:      map[ai.Provider]map[string]ai.Model[ai.API]{h.model.Provider: {h.model.ID: h.model}},
 	})
 	return h
 }

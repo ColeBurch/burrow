@@ -360,17 +360,9 @@ func streamAssistantResponse(
 	}
 
 	options := config.SimpleStreamOptions
-	if config.GetAPIKey != nil {
-		if apiKey := config.GetAPIKey(string(config.Model.Provider)); apiKey != nil {
-			options.ApiKey = apiKey
-		}
-	}
-
 	options.Signal = signal
-
 	messageID := newMessageID()
-	response, err := streamFn(signal, config.Model, llmContext, &options)
-	if err != nil {
+	failed := func(err error) (ai.AssistantMessage, error) {
 		message := AssistantErrorMessage(signal, config.Model, err)
 		agentContext.Messages = append(agentContext.Messages, message)
 		if err := emit(MessageStartEvent{Type: "message_start", MessageID: messageID, Message: message}); err != nil {
@@ -381,16 +373,23 @@ func streamAssistantResponse(
 		}
 		return message, nil
 	}
+
+	// Auth is resolved per request, so a token refreshed mid-run is picked up.
+	model := config.Model
+	if config.ResolveAuth != nil {
+		auth, err := config.ResolveAuth(signal, config.Model)
+		if err != nil {
+			return failed(err)
+		}
+		model = ai.ApplyModelAuth(model, &options.StreamOptions, auth)
+	}
+
+	response, err := streamFn(signal, model, llmContext, &options)
+	if err != nil {
+		return failed(err)
+	}
 	if response == nil {
-		message := AssistantErrorMessage(signal, config.Model, errors.New("stream function returned nil stream"))
-		agentContext.Messages = append(agentContext.Messages, message)
-		if err := emit(MessageStartEvent{Type: "message_start", MessageID: messageID, Message: message}); err != nil {
-			return message, err
-		}
-		if err := emit(MessageEndEvent{Type: "message_end", MessageID: messageID, Message: message}); err != nil {
-			return message, err
-		}
-		return message, nil
+		return failed(errors.New("stream function returned nil stream"))
 	}
 
 	addedPartial := false

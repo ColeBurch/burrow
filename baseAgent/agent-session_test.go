@@ -123,10 +123,9 @@ func TestAgentSessionPersistsAbortedMessageAfterRunCancellation(t *testing.T) {
 	}
 	model := registerManualCompactionProvider(t, "unused")
 	streamStarted := make(chan struct{})
-	apiKey := "test-key"
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{Model: &model},
-		GetAPIKey:    func(string) *string { return &apiKey },
+		ResolveAuth:  testAuth,
 		StreamFn: func(runCtx context.Context, _ ai.Model[ai.API], _ ai.ModelContext, _ *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
 			close(streamStarted)
 			stream := ai.NewAssistantMessageEventStream(2)
@@ -195,10 +194,9 @@ func TestAgentSessionMessagePersistenceTimesOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	model := registerManualCompactionProvider(t, "unused")
-	apiKey := "test-key"
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{Model: &model},
-		GetAPIKey:    func(string) *string { return &apiKey },
+		ResolveAuth:  testAuth,
 	})
 	session := NewAgentSession(a, sm)
 
@@ -333,13 +331,12 @@ func TestAgentSessionManualCompactionPersistsAndReplacesContext(t *testing.T) {
 	}
 	messages := seedManualCompactionHistory(t, ctx, sm, model)
 
-	apiKey := "test-key"
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{
 			Model:    &model,
 			Messages: messages,
 		},
-		GetAPIKey: func(string) *string { return &apiKey },
+		ResolveAuth: testAuth,
 	})
 	session := NewAgentSession(a, sm)
 	session.SetCompactionSettings(CompactionSettings{
@@ -398,10 +395,9 @@ func TestAgentSessionManualCompactionRejectsEmptySession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	apiKey := "test-key"
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{Model: &model},
-		GetAPIKey:    func(string) *string { return &apiKey },
+		ResolveAuth:  testAuth,
 	})
 	session := NewAgentSession(a, sm)
 
@@ -420,10 +416,9 @@ func TestAgentSessionManualCompactionAbortsActiveRun(t *testing.T) {
 	messages := seedManualCompactionHistory(t, ctx, sm, model)
 
 	streamStarted := make(chan struct{})
-	apiKey := "test-key"
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{Model: &model, Messages: messages},
-		GetAPIKey:    func(string) *string { return &apiKey },
+		ResolveAuth:  testAuth,
 		StreamFn: func(runCtx context.Context, _ ai.Model[ai.API], _ ai.ModelContext, _ *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
 			close(streamStarted)
 			stream := ai.NewAssistantMessageEventStream(2)
@@ -496,10 +491,9 @@ func TestAgentSessionManualCompactionRestoresQueuedMessages(t *testing.T) {
 
 	streamStarted := make(chan struct{})
 	var requests atomic.Int32
-	apiKey := "test-key"
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{Model: &model, Messages: messages},
-		GetAPIKey:    func(string) *string { return &apiKey },
+		ResolveAuth:  testAuth,
 		StreamFn: func(runCtx context.Context, _ ai.Model[ai.API], _ ai.ModelContext, _ *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
 			if requests.Add(1) == 1 {
 				close(streamStarted)
@@ -588,7 +582,6 @@ func TestAgentSessionManualCompactionFailureKeepsSessionInSync(t *testing.T) {
 	toolStarted := make(chan struct{})
 	var mu sync.Mutex
 	var sent [][]ai.Message
-	apiKey := "test-key"
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{
 			Model:    &model,
@@ -606,7 +599,7 @@ func TestAgentSessionManualCompactionFailureKeepsSessionInSync(t *testing.T) {
 			}},
 		},
 		ConvertToLLM: ConvertToLLM,
-		GetAPIKey:    func(string) *string { return &apiKey },
+		ResolveAuth:  testAuth,
 		StreamFn: func(runCtx context.Context, _ ai.Model[ai.API], modelContext ai.ModelContext, _ *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
 			reply := manualCompactionAssistantMessage("ok", model)
 			if runCtx.Err() != nil {
@@ -690,10 +683,9 @@ func TestAgentSessionAbortCompactionCancelsProviderRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	messages := seedManualCompactionHistory(t, ctx, sm, model)
-	apiKey := "test-key"
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{Model: &model, Messages: messages},
-		GetAPIKey:    func(string) *string { return &apiKey },
+		ResolveAuth:  testAuth,
 	})
 	session := NewAgentSession(a, sm)
 	session.SetCompactionSettings(CompactionSettings{Enabled: true, ReservedTokens: 100, KeepRecentTokens: 2})
@@ -804,11 +796,10 @@ func newAutoCompactionHarness(t *testing.T, blockSummary bool) *autoCompactionHa
 		t.Fatal(err)
 	}
 	messages := seedManualCompactionHistory(t, h.ctx, sm, h.model)
-	apiKey := "test-key"
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{Model: &h.model, Messages: messages},
 		ConvertToLLM: ConvertToLLM,
-		GetAPIKey:    func(string) *string { return &apiKey },
+		ResolveAuth:  testAuth,
 		StreamFn: func(_ context.Context, _ ai.Model[ai.API], modelContext ai.ModelContext, _ *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
 			h.mu.Lock()
 			defer h.mu.Unlock()
@@ -2013,8 +2004,8 @@ func TestAgentSessionEventsForwardToolEvents(t *testing.T) {
 				},
 			}},
 		},
-		GetAPIKey: oldAgent.GetAPIKey,
-		StreamFn:  oldAgent.StreamFn,
+		ResolveAuth: oldAgent.ResolveAuth,
+		StreamFn:    oldAgent.StreamFn,
 	}), h.session.SessionManager)
 	h.session.SetCompactionSettings(settings)
 	var forwarded, original []AgentSessionEvent

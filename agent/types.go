@@ -144,7 +144,7 @@ type AgentLoopConfig struct {
 	Stream              StreamFn             `json:"-"`
 	ConvertToLLM        ConvertToLLMFunc     `json:"convert_to_llm"`
 	TransformContext    TransformContextFunc `json:"transform_context"`
-	GetAPIKey           func(provider string) *string
+	ResolveAuth         func(ctx context.Context, model ai.Model[ai.API]) (ai.ModelAuth, error)
 	ShouldStopAfterTurn func(ctx ShouldStopAfterTurnContext) bool
 	GetSteeringMessages func(ctx context.Context) []AgentMessage
 	GetFollowUpMessages func(ctx context.Context) []AgentMessage

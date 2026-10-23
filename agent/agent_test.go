@@ -4,6 +4,8 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -377,5 +379,81 @@ func TestAgentForwardsSessionIDToStreamFnOptions(t *testing.T) {
 	}
 	if received == nil || *received != "session-def" {
 		t.Fatalf("updated session id not forwarded")
+	}
+}
+
+func TestAgentResolveAuthErrorEndsTurn(t *testing.T) {
+	model := ai.Model[ai.API]{ID: "m", Provider: "test"}
+	var streamed atomic.Bool
+	a := NewAgent(&AgentOptions{
+		InitialState: &InitialAgentState{Model: &model},
+		ResolveAuth: func(context.Context, ai.Model[ai.API]) (ai.ModelAuth, error) {
+			return ai.ModelAuth{}, errors.New("not logged in")
+		},
+		StreamFn: func(context.Context, ai.Model[ai.API], ai.ModelContext, *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
+			streamed.Store(true)
+			return agentDoneStream("ok"), nil
+		},
+	})
+	var ended []string
+	a.Subscribe(func(e AgentEvent, _ context.Context) error {
+		if end, ok := e.(MessageEndEvent); ok {
+			if message, ok := end.Message.(ai.AssistantMessage); ok {
+				ended = append(ended, message.ErrorMessage)
+			}
+		}
+		return nil
+	})
+
+	if err := a.PromptText(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if streamed.Load() {
+		t.Error("the model was called without auth")
+	}
+	s := a.State()
+	last, _ := s.Messages[len(s.Messages)-1].(ai.AssistantMessage)
+	if last.StopReason != ai.StopReasonError || last.ErrorMessage != "not logged in" || s.ErrorMessage != "not logged in" {
+		t.Errorf("last message = %+v, agent error %q; want the auth error", last, s.ErrorMessage)
+	}
+	if !reflect.DeepEqual(ended, []string{"not logged in"}) {
+		t.Errorf("assistant message_end errors = %q, want the auth error once", ended)
+	}
+}
+
+func TestAgentResolvesAuthPerRequest(t *testing.T) {
+	model := ai.Model[ai.API]{ID: "m", Provider: "test", BaseURL: "https://model.example"}
+	var resolved []string
+	var requests []string
+	a := NewAgent(&AgentOptions{
+		InitialState: &InitialAgentState{Model: &model},
+		ResolveAuth: func(ctx context.Context, m ai.Model[ai.API]) (ai.ModelAuth, error) {
+			if ctx == nil {
+				t.Error("ResolveAuth got no context")
+			}
+			resolved = append(resolved, m.BaseURL)
+			key := fmt.Sprintf("sk-%d", len(resolved))
+			baseURL := "https://auth.example"
+			return ai.ModelAuth{APIKey: &key, BaseURL: &baseURL}, nil
+		},
+		StreamFn: func(_ context.Context, m ai.Model[ai.API], _ ai.ModelContext, opts *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
+			requests = append(requests, m.BaseURL+" "+*opts.ApiKey)
+			return agentDoneStream("ok"), nil
+		},
+	})
+
+	for _, text := range []string{"one", "two"} {
+		if err := a.PromptText(context.Background(), text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if want := []string{"https://model.example", "https://model.example"}; !reflect.DeepEqual(resolved, want) {
+		t.Errorf("ResolveAuth saw base URLs %q, want the unchanged model's %q", resolved, want)
+	}
+	if want := []string{"https://auth.example sk-1", "https://auth.example sk-2"}; !reflect.DeepEqual(requests, want) {
+		t.Errorf("requests = %q, want %q", requests, want)
+	}
+	if got := a.State().Model.BaseURL; got != "https://model.example" {
+		t.Errorf("agent model BaseURL = %q, want it unchanged", got)
 	}
 }

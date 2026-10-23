@@ -883,3 +883,53 @@ func TestStreamOpenAIResponseOverHTTPCallsOnResponseOnceAfterRetries(t *testing.
 		t.Errorf("OnResponse statuses = %v, want [200]", statuses)
 	}
 }
+
+// A multi-tenant server's OpenAI environment must not reach a request made
+// with a user's key.
+func TestStreamOpenAIResponseOverHTTPIgnoresEnvironment(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	t.Setenv("OPENAI_BASE_URL", "https://env.openai.test/env/v1")
+	t.Setenv("OPENAI_ORG_ID", "org-env")
+	t.Setenv("OPENAI_PROJECT_ID", "proj-env")
+	t.Setenv("OPENAI_CUSTOM_HEADERS", "X-Env: leaked")
+	server := providertest.NewServer(t, oair.Reply(
+		oair.Text("msg_1", "ok"),
+		oair.Completed("resp_1", oair.Usage{Input: 1, Output: 1}),
+	))
+	model := oair.Model()
+	model.BaseURL = ""
+
+	if _, _, err := streamFromServer(t, t.Context(), server, model, ai.ModelContext{
+		Messages: []ai.Message{userText("hi")},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	requests := server.Requests()
+	if len(requests) != 1 {
+		t.Fatalf("got %d requests, want 1", len(requests))
+	}
+	req := requests[0]
+	if req.Path != "/v1/responses" {
+		t.Errorf("path = %q, want the default /v1/responses, not OPENAI_BASE_URL's", req.Path)
+	}
+	for header, want := range map[string]string{
+		"Authorization":       "Bearer test-key",
+		"Openai-Organization": "",
+		"Openai-Project":      "",
+		"X-Env":               "",
+	} {
+		if got := req.Header.Get(header); got != want {
+			t.Errorf("header %s = %q, want %q", header, got, want)
+		}
+	}
+}
+
+func TestStreamSimpleOpenAIResponsesNeedsAPIKey(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	for _, options := range []*ai.SimpleStreamOptions{nil, {}} {
+		if _, err := ai.StreamSimpleOpenAIResponses(oair.Model(), ai.ModelContext{}, options); err == nil || !strings.Contains(err.Error(), "No API key") {
+			t.Errorf("StreamSimpleOpenAIResponses(%v) error = %v, want no API key, not OPENAI_API_KEY", options, err)
+		}
+	}
+}

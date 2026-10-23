@@ -1,69 +1,76 @@
-// Adapted from pi's packages/coding-agent/src/core/model-registry.ts (MIT, see LICENSE).
+// Adapted from pi's packages/coding-agent/src/core/model-registry.ts and the
+// auth methods of Models in packages/ai/src/models.ts (MIT, see LICENSE).
 
 package baseAgent
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"os"
+	"maps"
 	"sort"
 
 	"github.com/ColeBurch/burrow/ai"
 )
 
-// AuthStore resolves provider API keys for model requests.
-type AuthStore interface {
-	APIKey(provider ai.Provider) (string, bool)
+// ErrNoAuth means a provider has no auth configured. Check for it with
+// errors.Is to ask the user to log in.
+var ErrNoAuth = errors.New("no auth configured")
+
+// ModelRegistryOptions configures a ModelRegistry. The zero value uses the
+// built-in models and providers, an in-memory credential store, and no
+// ambient auth.
+type ModelRegistryOptions struct {
+	// Credentials stores logins. Nil means a new in-memory store, so logins
+	// last only as long as the registry. Multi-user apps pass
+	// ScopeAuthStore(store, ownerID).
+	Credentials ai.CredentialStore
+	// AmbientAuth is where auth comes from for a provider with no stored
+	// credential. Nil means none, so environment variables such as
+	// OPENAI_API_KEY are ignored; pass ai.DefaultAuthContext() to read them.
+	// Leave it nil when the process environment belongs to a server rather
+	// than to the user.
+	AmbientAuth ai.AuthContext
+	// ProviderAuth says how each provider authenticates. Nil means
+	// ai.DefaultProviderAuth(). A provider missing from it is never
+	// configured.
+	ProviderAuth map[ai.Provider]ai.ProviderAuth
+	// Models is the model list. Nil means ai.Models.
+	Models map[ai.Provider]map[string]ai.Model[ai.API]
 }
 
-// EnvAuthStore resolves API keys from environment variables.
-type EnvAuthStore struct{}
-
-func (EnvAuthStore) APIKey(provider ai.Provider) (string, bool) {
-	var envName string
-	switch provider {
-	case ai.ProviderOpenAI:
-		envName = "OPENAI_API_KEY"
-	default:
-		return "", false
-	}
-
-	value := os.Getenv(envName)
-	return value, value != ""
-}
-
-// RequestAuth is the request-level auth and headers resolved for a model.
-type RequestAuth struct {
-	APIKey  *string
-	Headers map[string]string
-}
-
-// ModelRegistry provides model lookup and request auth resolution.
+// ModelRegistry provides model lookup, auth checks, and request auth.
 type ModelRegistry struct {
-	models map[ai.Provider]map[string]ai.Model[ai.API]
-	auth   AuthStore
+	models       map[ai.Provider]map[string]ai.Model[ai.API]
+	providerAuth map[ai.Provider]ai.ProviderAuth
+	credentials  ai.CredentialStore
+	ambientAuth  ai.AuthContext
 }
 
-// NewModelRegistry creates a registry using the built-in ai.Models list.
-func NewModelRegistry(auth AuthStore) *ModelRegistry {
-	if auth == nil {
-		auth = EnvAuthStore{}
+// NewModelRegistry creates a registry. options may be nil.
+func NewModelRegistry(options *ModelRegistryOptions) *ModelRegistry {
+	var o ModelRegistryOptions
+	if options != nil {
+		o = *options
+	}
+	if o.Credentials == nil {
+		o.Credentials = ai.NewInMemoryCredentialStore()
+	}
+	if o.AmbientAuth == nil {
+		o.AmbientAuth = ai.NoAmbientAuth()
+	}
+	if o.ProviderAuth == nil {
+		o.ProviderAuth = ai.DefaultProviderAuth()
+	}
+	if o.Models == nil {
+		o.Models = ai.Models
 	}
 
 	return &ModelRegistry{
-		models: cloneModels(ai.Models),
-		auth:   auth,
-	}
-}
-
-// NewModelRegistryWithModels creates a registry using an explicit model set.
-func NewModelRegistryWithModels(auth AuthStore, models map[ai.Provider]map[string]ai.Model[ai.API]) *ModelRegistry {
-	if auth == nil {
-		auth = EnvAuthStore{}
-	}
-
-	return &ModelRegistry{
-		models: cloneModels(models),
-		auth:   auth,
+		models:       cloneModels(o.Models),
+		providerAuth: maps.Clone(o.ProviderAuth),
+		credentials:  o.Credentials,
+		ambientAuth:  o.AmbientAuth,
 	}
 }
 
@@ -91,16 +98,28 @@ func (r *ModelRegistry) All() []ai.Model[ai.API] {
 	return out
 }
 
-// Available returns models whose provider has configured auth.
-func (r *ModelRegistry) Available() []ai.Model[ai.API] {
+// Available returns models whose provider has auth configured. It checks
+// each provider once and never refreshes tokens, so a listed model can still
+// fail at request time, such as when an OAuth refresh fails.
+func (r *ModelRegistry) Available(ctx context.Context) ([]ai.Model[ai.API], error) {
 	models := r.All()
+	configured := map[ai.Provider]bool{}
 	out := make([]ai.Model[ai.API], 0, len(models))
 	for _, model := range models {
-		if r.HasConfiguredAuth(model) {
+		ok, checked := configured[model.Provider]
+		if !checked {
+			check, err := r.CheckAuth(ctx, model.Provider)
+			if err != nil {
+				return nil, err
+			}
+			ok = check != nil
+			configured[model.Provider] = ok
+		}
+		if ok {
 			out = append(out, model)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // Find returns a model by provider and model ID.
@@ -117,32 +136,95 @@ func (r *ModelRegistry) Find(provider ai.Provider, modelID string) (ai.Model[ai.
 	return cloneModel(model), true
 }
 
-// HasConfiguredAuth reports whether a model's provider has an API key.
-func (r *ModelRegistry) HasConfiguredAuth(model ai.Model[ai.API]) bool {
-	_, ok := r.auth.APIKey(model.Provider)
-	return ok
+// CheckAuth reports whether provider has auth configured, and from where,
+// without refreshing tokens. It returns nil, nil when it is not configured.
+// See ai.CheckProviderAuth.
+func (r *ModelRegistry) CheckAuth(ctx context.Context, provider ai.Provider) (*ai.AuthCheck, error) {
+	auth, ok := r.providerAuth[provider]
+	if !ok {
+		return nil, ctx.Err()
+	}
+	return ai.CheckProviderAuth(ctx, provider, auth, r.credentials, r.ambientAuth)
 }
 
-// APIKeyAndHeaders resolves the API key and headers to use for a model request.
-func (r *ModelRegistry) APIKeyAndHeaders(model ai.Model[ai.API]) (RequestAuth, error) {
-	apiKey, ok := r.auth.APIKey(model.Provider)
-	if !ok {
-		return RequestAuth{}, fmt.Errorf("no API key found for provider %q", model.Provider)
-	}
-
-	headers := map[string]string{}
-	if model.Headers != nil {
-		for key, value := range *model.Headers {
-			headers[key] = value
+// Auth resolves the auth for a request to model, refreshing an OAuth token if
+// it is about to expire. The model's own headers are laid over the auth's.
+// Apply the result with ai.ApplyModelAuth.
+//
+// It returns an error wrapping ErrNoAuth when the provider is not configured,
+// and an *ai.AuthError when the credential store or a refresh fails. See
+// ai.ResolveProviderAuth.
+func (r *ModelRegistry) Auth(ctx context.Context, model ai.Model[ai.API]) (ai.ModelAuth, error) {
+	var result *ai.AuthResult
+	if auth, ok := r.providerAuth[model.Provider]; ok {
+		var err error
+		result, err = ai.ResolveProviderAuth(ctx, model.Provider, auth, r.credentials, r.ambientAuth, nil)
+		if err != nil {
+			return ai.ModelAuth{}, err
 		}
 	}
+	if result == nil {
+		if err := ctx.Err(); err != nil {
+			return ai.ModelAuth{}, err
+		}
+		return ai.ModelAuth{}, fmt.Errorf("provider %q: %w", model.Provider, ErrNoAuth)
+	}
 
-	return RequestAuth{APIKey: &apiKey, Headers: headers}, nil
+	// result.Env is provider config, which no built-in provider reads yet.
+	auth := result.Auth
+	if model.Headers != nil {
+		auth.Headers = ai.MergeHeaders(auth.Headers, *model.Headers)
+	}
+	return auth, nil
 }
 
-// APIKeyForProvider resolves a provider API key.
-func (r *ModelRegistry) APIKeyForProvider(provider ai.Provider) (string, bool) {
-	return r.auth.APIKey(provider)
+// Login runs provider's login flow for the credential type typ and stores the
+// credential, replacing any stored one. The flow runs before the store is
+// locked, since it waits on the user.
+func (r *ModelRegistry) Login(ctx context.Context, provider ai.Provider, typ ai.CredentialType, in ai.AuthInteraction) error {
+	auth := r.providerAuth[provider]
+	var login func(context.Context, ai.AuthInteraction) (*ai.Credential, error)
+	switch {
+	case typ == ai.CredentialAPIKey && auth.APIKey != nil:
+		login = auth.APIKey.Login
+	case typ == ai.CredentialOAuth && auth.OAuth != nil:
+		login = auth.OAuth.Login
+	}
+	if login == nil {
+		return fmt.Errorf("provider %q has no %s login", provider, typ)
+	}
+
+	credential, err := login(ctx, in)
+	if err != nil {
+		return err
+	}
+	if credential == nil || credential.Type != typ {
+		return fmt.Errorf("%s login for provider %q returned no %s credential", typ, provider, typ)
+	}
+
+	if _, err := r.credentials.Modify(ctx, provider, func(*ai.Credential) (*ai.Credential, error) {
+		return credential, nil
+	}); err != nil {
+		return storeError(ctx, provider, "modify", err)
+	}
+	return nil
+}
+
+// Logout deletes provider's stored credential. Ambient auth, such as an
+// environment variable, may still configure the provider afterwards.
+func (r *ModelRegistry) Logout(ctx context.Context, provider ai.Provider) error {
+	if err := r.credentials.Delete(ctx, provider); err != nil {
+		return storeError(ctx, provider, "delete", err)
+	}
+	return nil
+}
+
+// storeError wraps a credential store failure as ai.ResolveProviderAuth does.
+func storeError(ctx context.Context, provider ai.Provider, op string, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return &ai.AuthError{Code: ai.AuthErrorStore, Provider: provider, Message: fmt.Sprintf("credential store %s failed for %s", op, provider), Err: err}
 }
 
 // ProviderDisplayName returns a human-friendly provider name.

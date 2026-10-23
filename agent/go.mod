@@ -3,7 +3,7 @@ module github.com/ColeBurch/burrow/agent
 go 1.27.3
 
 require (
-	github.com/ColeBurch/burrow/ai v0.5.1
+	github.com/ColeBurch/burrow/ai v0.6.0
 	github.com/govalues/decimal v0.1.36
 	github.com/openai/openai-go/v3 v3.35.0
 )

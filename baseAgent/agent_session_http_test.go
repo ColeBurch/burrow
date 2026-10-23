@@ -55,12 +55,11 @@ func newHTTPCompactionHarness(t *testing.T, handlers ...http.Handler) *httpCompa
 	}
 	// Seed with the unrouted model: replies from the provider carry its API.
 	messages := seedManualCompactionHistory(t, ctx, sm, openairesponses.Model())
-	apiKey := "test-key"
 	systemPrompt := httpCompactionSystemPrompt
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{SystemPrompt: &systemPrompt, Model: &h.model, Messages: messages},
 		ConvertToLLM: ConvertToLLM,
-		GetAPIKey:    func(string) *string { return &apiKey },
+		ResolveAuth:  testAuth,
 	})
 	h.session = NewAgentSession(a, sm)
 	h.session.SetCompactionSettings(CompactionSettings{Enabled: true, ReservedTokens: 100, KeepRecentTokens: 2})

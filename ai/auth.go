@@ -1,5 +1,6 @@
-// Ported from pi's packages/ai/src/auth/types.ts and
-// packages/ai/src/auth/context.ts (MIT, see LICENSE).
+// Ported from pi's packages/ai/src/auth/types.ts,
+// packages/ai/src/auth/context.ts and the header merging and applyAuth in
+// packages/ai/src/models.ts (MIT, see LICENSE).
 
 package ai
 
@@ -72,6 +73,45 @@ type ModelAuth struct {
 	APIKey  *string
 	Headers map[string]string
 	BaseURL *string
+}
+
+// MergeHeaders merges header maps into a new map. Later maps win, and names
+// compare case-insensitively, so "authorization" replaces "Authorization".
+// The winning spelling is kept. It returns nil when there are no headers.
+func MergeHeaders(layers ...map[string]string) map[string]string {
+	var merged map[string]string
+	for _, layer := range layers {
+		for name, value := range layer {
+			if merged == nil {
+				merged = map[string]string{}
+			}
+			for existing := range merged {
+				if existing != name && strings.EqualFold(existing, name) {
+					delete(merged, existing)
+				}
+			}
+			merged[name] = value
+		}
+	}
+	return merged
+}
+
+// ApplyModelAuth applies auth to a request: it sets options.ApiKey, lays
+// auth.Headers under options.Headers, and returns model with auth.BaseURL. The
+// caller's headers win, so an app can still override a header per request.
+// It changes neither the caller's header map nor model's.
+func ApplyModelAuth[T API](model Model[T], options *StreamOptions, auth ModelAuth) Model[T] {
+	if auth.APIKey != nil {
+		key := *auth.APIKey
+		options.ApiKey = &key
+	}
+	if len(auth.Headers) > 0 {
+		options.Headers = MergeHeaders(auth.Headers, options.Headers)
+	}
+	if auth.BaseURL != nil {
+		model.BaseURL = *auth.BaseURL
+	}
+	return model
 }
 
 // AuthResult is resolved request auth for a provider.

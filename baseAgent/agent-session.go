@@ -460,13 +460,6 @@ func (s *AgentSession) compactContext(compactionCtx context.Context, reason Comp
 	if model.ID == "" || model.Name == "unknown" {
 		return nil, errors.New("model is undefined")
 	}
-	if s.Agent.GetAPIKey == nil {
-		return nil, fmt.Errorf("no API key found for provider %q", model.Provider)
-	}
-	apiKey := s.Agent.GetAPIKey(string(model.Provider))
-	if apiKey == nil || *apiKey == "" {
-		return nil, fmt.Errorf("no API key found for provider %q", model.Provider)
-	}
 
 	pathEntries := s.SessionManager.GetBranch()
 	preparation := PrepareCompaction(pathEntries, s.GetCompactionSettings())
@@ -477,14 +470,6 @@ func (s *AgentSession) compactContext(compactionCtx context.Context, reason Comp
 			}
 		}
 		return nil, ErrNothingToCompact
-	}
-
-	var headers map[string]string
-	if model.Headers != nil {
-		headers = make(map[string]string, len(*model.Headers))
-		for key, value := range *model.Headers {
-			headers[key] = value
-		}
 	}
 
 	req := CompactionRequest{
@@ -500,8 +485,16 @@ func (s *AgentSession) compactContext(compactionCtx context.Context, reason Comp
 	var usedDefault atomic.Bool
 	next := func(ctx context.Context, req CompactionRequest) (*CompactionResult, error) {
 		usedDefault.Store(true)
-		return Compact(ctx, req.Preparation, model, *apiKey, &CompactOptions{
-			Headers:            headers,
+		// Resolved here, not up front, so a hook that never calls the model
+		// needs no auth and a refreshed token is used.
+		var auth ai.ModelAuth
+		if s.Agent.ResolveAuth != nil {
+			var err error
+			if auth, err = s.Agent.ResolveAuth(ctx, model); err != nil {
+				return nil, err
+			}
+		}
+		return Compact(ctx, req.Preparation, model, auth, &CompactOptions{
 			CustomInstructions: req.CustomInstructions,
 			ThinkingLevel:      state.ThinkingLevel,
 			Prompts:            req.Prompts,
@@ -596,9 +589,11 @@ func branchContains(entries []SessionEntry, id string) bool {
 /**
  * Send a prompt to the agent.
  * - During streaming, queues via steer() or followUp() based on streamingBehavior option
- * - Validates model and API key before sending (when not streaming)
+ * - Validates the model before sending (when not streaming)
  * Error if streaming and no streamingBehavior specified
- * Error if no model selected or no API key available (when not streaming)
+ * Error if no model selected (when not streaming)
+ * Auth is resolved per request; a failure, such as ErrNoAuth, ends the turn
+ * with an assistant error message rather than an error from Prompt.
  */
 func (s *AgentSession) Prompt(ctx context.Context, text string, options *PromptOptions) error {
 	if s.Agent == nil {

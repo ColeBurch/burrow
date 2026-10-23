@@ -3,8 +3,8 @@ module github.com/ColeBurch/burrow/baseAgent
 go 1.27.3
 
 require (
-	github.com/ColeBurch/burrow/agent v0.5.1
-	github.com/ColeBurch/burrow/ai v0.5.1
+	github.com/ColeBurch/burrow/agent v0.6.0
+	github.com/ColeBurch/burrow/ai v0.6.0
 	github.com/govalues/decimal v0.1.36
 	golang.org/x/sync v0.22.0
 )

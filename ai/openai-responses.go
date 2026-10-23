@@ -9,13 +9,11 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/govalues/decimal"
-	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
@@ -101,12 +99,13 @@ func StreamOpenAIResponses(model Model[API], modelContext ModelContext, options 
 	return StreamSimpleOpenAIResponses(model, modelContext, simpleOptions)
 }
 
+// StreamSimpleOpenAIResponses streams a response. It never reads the
+// environment: the API key comes from options.ApiKey, which callers resolve
+// with ResolveProviderAuth and apply with ApplyModelAuth.
 func StreamSimpleOpenAIResponses(model Model[API], modelContext ModelContext, options *SimpleStreamOptions) (*AssistantMessageEventStream, error) {
 	apiKey := ""
 	if options != nil && options.ApiKey != nil {
 		apiKey = *options.ApiKey
-	} else {
-		apiKey = getEnvAPIKey(model.Provider)
 	}
 	if apiKey == "" {
 		return nil, fmt.Errorf("No API key for provider: %s", model.Provider)
@@ -128,15 +127,6 @@ func StreamSimpleOpenAIResponses(model Model[API], modelContext ModelContext, op
 	}
 
 	return StreamOpenAIResponse(ctx, model, modelContext, base)
-}
-
-func getEnvAPIKey(provider Provider) string {
-	switch provider {
-	case ProviderOpenAI:
-		return os.Getenv("OPENAI_API_KEY")
-	default:
-		return ""
-	}
 }
 
 func buildBaseOpenAIResponseOptions(options *SimpleStreamOptions, apiKey string) *OpenAIResponseOptions {
@@ -273,7 +263,7 @@ func StreamOpenAIResponse(ctx context.Context, model Model[API], modelContext Mo
 		},
 	))
 
-	openaiStream := client.Responses.NewStreaming(ctx, params, requestOptions...)
+	openaiStream := client.NewStreaming(ctx, params, requestOptions...)
 
 	processor := &responsesStreamProcessor{
 		output: &output,
@@ -340,23 +330,34 @@ func pushAssistantStreamError(stream *AssistantMessageEventStream, output *Assis
 	})
 }
 
+// openAIHTTPClient is the SDK's default client, shared so requests reuse
+// connections: its ResponseHeaderTimeout fails a server that accepts the
+// connection but never responds, and does not limit a stream's body.
+var openAIHTTPClient = func() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 10 * time.Minute
+	return &http.Client{Transport: transport}
+}()
+
+// CreateOpenAIResponsesClient returns a Responses client configured only from
+// its arguments. Unlike openai.NewClient, it reads no environment variables,
+// so a server's OPENAI_BASE_URL, OPENAI_ORG_ID or OPENAI_PROJECT_ID cannot
+// leak into a request made with a user's key.
 func CreateOpenAIResponsesClient(
 	model Model[API],
 	modelContext ModelContext,
 	apiKey *string,
 	optionHeaders *map[string]string,
 	sessionID *string,
-) (openai.Client, error) {
+) (responses.ResponseService, error) {
 	_ = modelContext // Used by provider-specific dynamic headers when those providers are implemented.
 
 	resolvedAPIKey := ""
 	if apiKey != nil {
 		resolvedAPIKey = *apiKey
-	} else {
-		resolvedAPIKey = os.Getenv("OPENAI_API_KEY")
 	}
 	if resolvedAPIKey == "" {
-		return openai.Client{}, fmt.Errorf("OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass it as an argument")
+		return responses.ResponseService{}, fmt.Errorf("OpenAI API key is required")
 	}
 
 	compat := getCompat(model)
@@ -381,7 +382,11 @@ func CreateOpenAIResponsesClient(
 		}
 	}
 
-	clientOptions := []option.RequestOption{option.WithAPIKey(resolvedAPIKey)}
+	clientOptions := []option.RequestOption{
+		option.WithHTTPClient(openAIHTTPClient),
+		option.WithEnvironmentProduction(),
+		option.WithAPIKey(resolvedAPIKey),
+	}
 	if model.BaseURL != "" {
 		clientOptions = append(clientOptions, option.WithBaseURL(model.BaseURL))
 	}
@@ -389,7 +394,7 @@ func CreateOpenAIResponsesClient(
 		clientOptions = append(clientOptions, option.WithHeader(k, v))
 	}
 
-	return openai.NewClient(clientOptions...), nil
+	return responses.NewResponseService(clientOptions...), nil
 }
 
 func BuildOpenAIResponsesParams(

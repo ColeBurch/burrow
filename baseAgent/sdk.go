@@ -13,11 +13,18 @@ import (
 const DefaultThinkingLevel = ai.ThinkingLevelMedium
 
 type CreateAgentSessionOptions struct {
-	Model              ai.Model[ai.API]
-	ThinkingLevel      ai.ModelThinkingLevel
-	SessionManager     *SessionManager
-	ModelRegistry      *ModelRegistry
-	AuthStore          AuthStore
+	Model          ai.Model[ai.API]
+	ThinkingLevel  ai.ModelThinkingLevel
+	SessionManager *SessionManager
+	// ModelRegistry finds models and resolves their auth. Nil means
+	// NewModelRegistry with Credentials and AmbientAuth.
+	ModelRegistry *ModelRegistry
+	// Credentials and AmbientAuth configure the default registry; see
+	// ModelRegistryOptions. Set them or ModelRegistry, not both. With neither,
+	// nothing is configured until a login, so to use OPENAI_API_KEY set
+	// AmbientAuth to ai.DefaultAuthContext().
+	Credentials        ai.CredentialStore
+	AmbientAuth        ai.AuthContext
 	CompactionSettings *CompactionSettings
 	// CompactionHook wraps manual and automatic compaction. See CompactionHook.
 	CompactionHook CompactionHook
@@ -56,16 +63,18 @@ type CreateAgentSessionResult struct {
 	ModelFallbackMessage *string
 }
 
-func FindInitialModel(registry *ModelRegistry) (ai.Model[ai.API], bool) {
+// FindInitialModel returns the first available model in registry, or false
+// when no provider has auth configured.
+func FindInitialModel(ctx context.Context, registry *ModelRegistry) (ai.Model[ai.API], bool, error) {
 	if registry == nil {
 		registry = NewModelRegistry(nil)
 	}
 
-	available := registry.Available()
-	if len(available) == 0 {
-		return ai.Model[ai.API]{}, false
+	available, err := registry.Available(ctx)
+	if err != nil || len(available) == 0 {
+		return ai.Model[ai.API]{}, false, err
 	}
-	return available[0], true
+	return available[0], true, nil
 }
 
 // CreateAgentSession creates a minimal, generic agent session with no tools.
@@ -78,7 +87,12 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 
 	registry := options.ModelRegistry
 	if registry == nil {
-		registry = NewModelRegistry(options.AuthStore)
+		registry = NewModelRegistry(&ModelRegistryOptions{
+			Credentials: options.Credentials,
+			AmbientAuth: options.AmbientAuth,
+		})
+	} else if options.Credentials != nil || options.AmbientAuth != nil {
+		return nil, errors.New("set ModelRegistry or Credentials and AmbientAuth, not both")
 	}
 
 	sessionManager := options.SessionManager
@@ -105,7 +119,15 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 	model := options.Model
 	var modelFallbackMessage *string
 	if model.ID == "" && hasExistingSession && existingSession.Model != nil {
-		if restored, ok := registry.Find(ai.Provider(existingSession.Model.Provider), existingSession.Model.ModelID); ok && registry.HasConfiguredAuth(restored) {
+		restored, ok := registry.Find(ai.Provider(existingSession.Model.Provider), existingSession.Model.ModelID)
+		if ok {
+			check, err := registry.CheckAuth(ctx, restored.Provider)
+			if err != nil {
+				return nil, err
+			}
+			ok = check != nil
+		}
+		if ok {
 			model = restored
 		} else {
 			msg := "could not restore model " + existingSession.Model.Provider + "/" + existingSession.Model.ModelID
@@ -114,9 +136,12 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 	}
 
 	if model.ID == "" {
-		initial, ok := FindInitialModel(registry)
+		initial, ok, err := FindInitialModel(ctx, registry)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
-			return nil, errors.New("no models available; set OPENAI_API_KEY or configure a model provider")
+			return nil, errors.New("no models available; log in to a provider, or set AmbientAuth to ai.DefaultAuthContext() to use OPENAI_API_KEY")
 		}
 		model = initial
 		if modelFallbackMessage != nil {
@@ -159,14 +184,8 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 			Tools:         tools,
 			Messages:      existingSession.Messages,
 		},
-		ConvertToLLM: ConvertToLLM,
-		GetAPIKey: func(provider string) *string {
-			key, ok := registry.APIKeyForProvider(ai.Provider(provider))
-			if !ok {
-				return nil
-			}
-			return &key
-		},
+		ConvertToLLM:   ConvertToLLM,
+		ResolveAuth:    registry.Auth,
 		SessionID:      &sessionID,
 		ToolExecution:  toolExecution,
 		BeforeToolCall: options.BeforeToolCall,

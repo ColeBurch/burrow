@@ -34,6 +34,12 @@ func testMessageEntry(id string, message agent.AgentMessage) *SessionMessageEntr
 	}
 }
 
+// testKeyAuth is request auth with the API key "test-key".
+func testKeyAuth() ai.ModelAuth { return ai.ModelAuth{APIKey: ptr("test-key")} }
+
+// testAuth is an agent ResolveAuth that returns testKeyAuth.
+func testAuth(context.Context, ai.Model[ai.API]) (ai.ModelAuth, error) { return testKeyAuth(), nil }
+
 func testUserMessage(text string) ai.UserMessage {
 	return ai.UserMessage{
 		Role: ai.RoleUser,
@@ -295,7 +301,7 @@ func TestCompactGeneratesSplitTurnSummariesInParallel(t *testing.T) {
 	}
 	thinkingLevel := ai.ThinkingLevelHigh
 
-	result, err := Compact(context.Background(), preparation, model, "test-key", &CompactOptions{
+	result, err := Compact(context.Background(), preparation, model, testKeyAuth(), &CompactOptions{
 		Headers:            map[string]string{"X-Test": "value"},
 		CustomInstructions: "focus on tests",
 		ThinkingLevel:      thinkingLevel,
@@ -379,7 +385,7 @@ func TestCompactSplitTurnWithoutNewHistory(t *testing.T) {
 				Settings:        CompactionSettings{ReservedTokens: 100},
 			}
 
-			result, err := Compact(context.Background(), preparation, model, "test-key", nil)
+			result, err := Compact(context.Background(), preparation, model, testKeyAuth(), nil)
 			if err != nil {
 				t.Fatalf("Compact() error = %v", err)
 			}
@@ -426,7 +432,7 @@ func TestCompactSplitTurnFailureCancelsOtherSummary(t *testing.T) {
 		Settings:            CompactionSettings{ReservedTokens: 100},
 	}
 
-	_, err := Compact(context.Background(), preparation, model, "test-key", nil)
+	_, err := Compact(context.Background(), preparation, model, testKeyAuth(), nil)
 	if err == nil || err.Error() != "turn prefix summarization failed: turn prefix failed" {
 		t.Fatalf("Compact() error = %v, want the turn prefix failure", err)
 	}
@@ -1817,7 +1823,7 @@ func TestGenerateSummaryBuildsInitialRequest(t *testing.T) {
 		[]agent.AgentMessage{testUserMessage("summarize this")},
 		model,
 		101,
-		"test-key",
+		testKeyAuth(),
 		&GenerateSummaryOptions{
 			Headers:       headers,
 			ThinkingLevel: ai.ThinkingLevelHigh,
@@ -1870,7 +1876,7 @@ func TestGenerateSummaryBuildsUpdateRequest(t *testing.T) {
 		[]agent.AgentMessage{testUserMessage("new work")},
 		model,
 		100,
-		"test-key",
+		testKeyAuth(),
 		&GenerateSummaryOptions{
 			PreviousSummary:    "old summary",
 			CustomInstructions: "focus on errors",
@@ -1940,7 +1946,7 @@ func TestGenerateSummaryReasoningOptions(t *testing.T) {
 				[]agent.AgentMessage{testUserMessage("message")},
 				model,
 				100,
-				"test-key",
+				testKeyAuth(),
 				&GenerateSummaryOptions{ThinkingLevel: test.thinkingLevel},
 			)
 			if err != nil {
@@ -1967,7 +1973,7 @@ func TestGenerateSummaryErrors(t *testing.T) {
 			return nil, providerError
 		})
 
-		_, err := GenerateSummary(context.Background(), nil, model, 100, "test-key", nil)
+		_, err := GenerateSummary(context.Background(), nil, model, 100, testKeyAuth(), nil)
 		if !errors.Is(err, providerError) {
 			t.Fatalf("GenerateSummary() error = %v, want wrapped provider error", err)
 		}
@@ -2005,7 +2011,7 @@ func TestGenerateSummaryErrors(t *testing.T) {
 				}), nil
 			})
 
-			_, err := GenerateSummary(context.Background(), nil, model, 100, "test-key", nil)
+			_, err := GenerateSummary(context.Background(), nil, model, 100, testKeyAuth(), nil)
 			if err == nil || err.Error() != test.want {
 				t.Fatalf("GenerateSummary() error = %v, want %q", err, test.want)
 			}
@@ -2055,7 +2061,7 @@ func TestGenerateSummaryRejectsUnusableResponses(t *testing.T) {
 				return completedSummaryTestStream(test.response), nil
 			})
 
-			_, err := GenerateSummary(context.Background(), nil, model, 100, "test-key", nil)
+			_, err := GenerateSummary(context.Background(), nil, model, 100, testKeyAuth(), nil)
 			if err == nil || err.Error() != test.want {
 				t.Fatalf("GenerateSummary() error = %v, want %q", err, test.want)
 			}
@@ -2094,7 +2100,7 @@ func TestGenerateSummaryReturnsOnlyTextContent(t *testing.T) {
 				}), nil
 			})
 
-			got, err := GenerateSummary(context.Background(), nil, model, 100, "test-key", nil)
+			got, err := GenerateSummary(context.Background(), nil, model, 100, testKeyAuth(), nil)
 			if err != nil {
 				t.Fatalf("GenerateSummary() error = %v", err)
 			}
@@ -2137,7 +2143,7 @@ func TestCompactUsesCustomSummaryPrompts(t *testing.T) {
 		PreviousSummary: &previousSummary,
 		Settings:        CompactionSettings{ReservedTokens: 100},
 	}
-	_, err := Compact(context.Background(), preparation, model, "test-key", &CompactOptions{
+	_, err := Compact(context.Background(), preparation, model, testKeyAuth(), &CompactOptions{
 		Prompts: SummaryPrompts{
 			System:     "custom system",
 			Initial:    "custom initial",
@@ -2265,7 +2271,7 @@ func TestCompactionPrepareCompactAppendAndReloadFlow(t *testing.T) {
 		t.Fatalf("first FirstKeptEntryID = %q, want %q", firstPreparation.FirstKeptEntryID, "kept-user")
 	}
 
-	firstResult, err := Compact(ctx, firstPreparation, model, "test-key", nil)
+	firstResult, err := Compact(ctx, firstPreparation, model, testKeyAuth(), nil)
 	if err != nil {
 		t.Fatalf("first Compact() error = %v", err)
 	}
@@ -2309,7 +2315,7 @@ func TestCompactionPrepareCompactAppendAndReloadFlow(t *testing.T) {
 		t.Fatalf("second PreviousSummary = %v, want %q", secondPreparation.PreviousSummary, "first summary")
 	}
 
-	secondResult, err := Compact(ctx, secondPreparation, model, "test-key", nil)
+	secondResult, err := Compact(ctx, secondPreparation, model, testKeyAuth(), nil)
 	if err != nil {
 		t.Fatalf("second Compact() error = %v", err)
 	}
@@ -2525,13 +2531,12 @@ func newHookTestSession(t *testing.T) *hookTestSession {
 
 func (h *hookTestSession) newSession(t *testing.T, sm *SessionManager) *AgentSession {
 	t.Helper()
-	apiKey := "test-key"
 	a := agent.NewAgent(&agent.AgentOptions{
 		InitialState: &agent.InitialAgentState{
 			Model:    &h.model,
 			Messages: sm.BuildSessionContext().Messages,
 		},
-		GetAPIKey: func(string) *string { return &apiKey },
+		ResolveAuth: testAuth,
 	})
 	session := NewAgentSession(a, sm)
 	session.SetCompactionSettings(CompactionSettings{Enabled: true, ReservedTokens: 100, KeepRecentTokens: 2})

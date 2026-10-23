@@ -22,9 +22,9 @@ func httpTestModel(t *testing.T, server *providertest.Server, model ai.Model[ai.
 	return server.Route(t, model)
 }
 
-func httpTestAPIKey(string) *string {
+func httpTestAuth(context.Context, ai.Model[ai.API]) (ai.ModelAuth, error) {
 	key := "test-key"
-	return &key
+	return ai.ModelAuth{APIKey: &key}, nil
 }
 
 func TestAgentHTTPToolCallLoop(t *testing.T) {
@@ -42,7 +42,7 @@ func TestAgentHTTPToolCallLoop(t *testing.T) {
 	model := httpTestModel(t, server, openairesponses.Model())
 	a := NewAgent(&AgentOptions{
 		InitialState: &InitialAgentState{Model: &model, Tools: []AgentTool[any, any]{calculateToolE2E()}},
-		GetAPIKey:    httpTestAPIKey,
+		ResolveAuth:  httpTestAuth,
 	})
 
 	if err := a.PromptText(context.Background(), "What is 123 * 456?"); err != nil {
@@ -96,7 +96,7 @@ func TestAgentHTTPSettingsReachTheWire(t *testing.T) {
 	var statuses []int
 	a := NewAgent(&AgentOptions{
 		InitialState: &InitialAgentState{Model: &model, ThinkingLevel: &level},
-		GetAPIKey:    httpTestAPIKey,
+		ResolveAuth:  httpTestAuth,
 		SessionID:    &sessionID,
 		OnPayload: func(payload any, _ ai.Model[ai.API]) (any, error) {
 			params, ok := payload.(responses.ResponseNewParams)
@@ -164,7 +164,7 @@ func TestAgentHTTPAbortCancelsRequest(t *testing.T) {
 	base := openairesponses.Model()
 	base.BaseURL = server.URL + "/v1"
 	model := httpTestModel(t, server, base)
-	a := NewAgent(&AgentOptions{InitialState: &InitialAgentState{Model: &model}, GetAPIKey: httpTestAPIKey})
+	a := NewAgent(&AgentOptions{InitialState: &InitialAgentState{Model: &model}, ResolveAuth: httpTestAuth})
 
 	streaming := make(chan struct{})
 	var once sync.Once
@@ -216,7 +216,7 @@ func TestAgentHTTPProviderErrorInTranscript(t *testing.T) {
 		),
 	))
 	model := httpTestModel(t, server, openairesponses.Model())
-	a := NewAgent(&AgentOptions{InitialState: &InitialAgentState{Model: &model}, GetAPIKey: httpTestAPIKey})
+	a := NewAgent(&AgentOptions{InitialState: &InitialAgentState{Model: &model}, ResolveAuth: httpTestAuth})
 
 	if err := a.PromptText(context.Background(), "hi"); err != nil {
 		t.Fatal(err)
@@ -249,7 +249,7 @@ func TestAgentHTTPOmitsEmptySystemPrompt(t *testing.T) {
 		openairesponses.Completed("resp_1", openairesponses.Usage{Input: 5, Output: 1}),
 	))
 	model := httpTestModel(t, server, openairesponses.Model())
-	a := NewAgent(&AgentOptions{InitialState: &InitialAgentState{Model: &model}, GetAPIKey: httpTestAPIKey})
+	a := NewAgent(&AgentOptions{InitialState: &InitialAgentState{Model: &model}, ResolveAuth: httpTestAuth})
 
 	if err := a.PromptText(context.Background(), "hi"); err != nil {
 		t.Fatal(err)
@@ -259,6 +259,41 @@ func TestAgentHTTPOmitsEmptySystemPrompt(t *testing.T) {
 	for _, raw := range input {
 		if item, ok := raw.(map[string]any); ok && (item["role"] == "system" || item["role"] == "developer") {
 			t.Errorf("input has a %s message %#v, want none for an agent without a system prompt", item["role"], item)
+		}
+	}
+}
+
+func TestAgentHTTPAuthReachesTheWire(t *testing.T) {
+	server := providertest.NewServer(t, openairesponses.Reply(
+		openairesponses.Text("msg_1", "ok"),
+		openairesponses.Completed("resp_1", openairesponses.Usage{Input: 5, Output: 1}),
+	))
+	model := httpTestModel(t, server, openairesponses.Model())
+	a := NewAgent(&AgentOptions{
+		InitialState: &InitialAgentState{Model: &model},
+		ResolveAuth: func(context.Context, ai.Model[ai.API]) (ai.ModelAuth, error) {
+			key, baseURL := "sk-oauth", "https://auth.openai.test/proxy/v1"
+			return ai.ModelAuth{APIKey: &key, Headers: map[string]string{"X-Account": "acct_1"}, BaseURL: &baseURL}, nil
+		},
+	})
+
+	if err := a.PromptText(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if s := a.State(); s.ErrorMessage != "" {
+		t.Fatalf("agent error = %q", s.ErrorMessage)
+	}
+	requests := server.Requests()
+	if len(requests) != 1 {
+		t.Fatalf("got %d requests, want 1", len(requests))
+	}
+	req := requests[0]
+	if req.Path != "/proxy/v1/responses" {
+		t.Errorf("path = %q, want the auth base URL's /proxy/v1/responses", req.Path)
+	}
+	for header, want := range map[string]string{"Authorization": "Bearer sk-oauth", "X-Account": "acct_1"} {
+		if got := req.Header.Get(header); got != want {
+			t.Errorf("header %s = %q, want %q", header, got, want)
 		}
 	}
 }

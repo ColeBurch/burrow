@@ -530,7 +530,7 @@ func GenerateSummary(
 	currentMessages []agent.AgentMessage,
 	model ai.Model[ai.API],
 	reserveTokens int64,
-	apiKey string,
+	auth ai.ModelAuth,
 	options *GenerateSummaryOptions,
 ) (string, error) {
 	maxTokens := reserveTokens * 4 / 5
@@ -580,10 +580,10 @@ func GenerateSummary(
 		StreamOptions: ai.StreamOptions{
 			MaxTokens: &maxTokens,
 			Signal:    ctx,
-			ApiKey:    &apiKey,
 			Headers:   headers,
 		},
 	}
+	model = ai.ApplyModelAuth(model, &completionOptions.StreamOptions, auth)
 	if model.Reasoning && thinkingLevel != "" && thinkingLevel != ai.ThinkingLevelOff {
 		completionOptions.Reasoning = &thinkingLevel
 	}
@@ -894,18 +894,20 @@ func PrepareCompaction(
 
 // CompactOptions contains the optional parameters for Compact.
 type CompactOptions struct {
+	// Headers are sent with the summary requests, over the auth's headers.
 	Headers            map[string]string
 	CustomInstructions string
 	ThinkingLevel      ai.ModelThinkingLevel
 	Prompts            SummaryPrompts
 }
 
-// Compact generates summaries from prepared compaction data.
+// Compact generates summaries from prepared compaction data, calling model
+// with auth applied by ai.ApplyModelAuth.
 func Compact(
 	ctx context.Context,
 	preparation *CompactionPreparation,
 	model ai.Model[ai.API],
-	apiKey string,
+	auth ai.ModelAuth,
 	options *CompactOptions,
 ) (*CompactionResult, error) {
 	if preparation == nil {
@@ -959,7 +961,7 @@ func Compact(
 					preparation.MessagesToSummarize,
 					model,
 					preparation.Settings.ReservedTokens,
-					apiKey,
+					auth,
 					generateOptions,
 				)
 				return err
@@ -973,7 +975,7 @@ func Compact(
 				preparation.TurnPrefixMessages,
 				model,
 				preparation.Settings.ReservedTokens,
-				apiKey,
+				auth,
 				headers,
 				thinkingLevel,
 				prompts,
@@ -993,7 +995,7 @@ func Compact(
 			preparation.MessagesToSummarize,
 			model,
 			preparation.Settings.ReservedTokens,
-			apiKey,
+			auth,
 			generateOptions,
 		)
 		if err != nil {
@@ -1018,7 +1020,7 @@ func generateTurnPrefixSummary(
 	messages []agent.AgentMessage,
 	model ai.Model[ai.API],
 	reserveTokens int64,
-	apiKey string,
+	auth ai.ModelAuth,
 	headers map[string]string,
 	thinkingLevel ai.ModelThinkingLevel,
 	prompts SummaryPrompts,
@@ -1039,10 +1041,10 @@ func generateTurnPrefixSummary(
 		StreamOptions: ai.StreamOptions{
 			MaxTokens: &maxTokens,
 			Signal:    ctx,
-			ApiKey:    &apiKey,
 			Headers:   headers,
 		},
 	}
+	model = ai.ApplyModelAuth(model, &completionOptions.StreamOptions, auth)
 	if model.Reasoning && thinkingLevel != "" && thinkingLevel != ai.ThinkingLevelOff {
 		completionOptions.Reasoning = &thinkingLevel
 	}

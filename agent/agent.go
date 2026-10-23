@@ -137,7 +137,10 @@ type AgentOptions struct {
 	TransformContext TransformContextFunc
 	StreamFn         StreamFn
 
-	GetAPIKey func(provider string) *string
+	// ResolveAuth returns the auth for each model request. It runs before
+	// every request, so it can refresh tokens. An error ends the turn with an
+	// error message instead of calling the model.
+	ResolveAuth func(ctx context.Context, model ai.Model[ai.API]) (ai.ModelAuth, error)
 
 	OnPayload  func(payload any, model ai.Model[ai.API]) (any, error)
 	OnResponse func(response ai.ProviderResponse, model ai.Model[ai.API]) error
@@ -265,7 +268,7 @@ type Agent struct {
 	ConvertToLLM     ConvertToLLMFunc
 	TransformContext TransformContextFunc
 	StreamFn         StreamFn
-	GetAPIKey        func(provider string) *string
+	ResolveAuth      func(ctx context.Context, model ai.Model[ai.API]) (ai.ModelAuth, error)
 
 	OnPayload  func(payload any, model ai.Model[ai.API]) (any, error)
 	OnResponse func(response ai.ProviderResponse, model ai.Model[ai.API]) error
@@ -327,7 +330,7 @@ func NewAgent(options *AgentOptions) *Agent {
 		ConvertToLLM:     convertToLLM,
 		TransformContext: options.TransformContext,
 		StreamFn:         streamFn,
-		GetAPIKey:        options.GetAPIKey,
+		ResolveAuth:      options.ResolveAuth,
 		OnPayload:        options.OnPayload,
 		OnResponse:       options.OnResponse,
 		BeforeToolCall:   options.BeforeToolCall,
@@ -623,7 +626,7 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 		Stream:           a.StreamFn,
 		ConvertToLLM:     a.ConvertToLLM,
 		TransformContext: a.TransformContext,
-		GetAPIKey:        a.GetAPIKey,
+		ResolveAuth:      a.ResolveAuth,
 		ToolExecution:    &toolExecution,
 		BeforeToolCall:   a.BeforeToolCall,
 		AfterToolCall:    a.AfterToolCall,

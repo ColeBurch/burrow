@@ -199,13 +199,44 @@ func RunLoop(
 	streamFn *StreamFn,
 ) error {
 	firstTurn := true
+	var lastCompletedTurn *PrepareNextTurnContext
 	pendingMessages := config.GetSteeringMessages(signal)
 
 	for {
 		hasMoreToolCalls := true
 
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
+			var preparedMessages []AgentMessage
 			if !firstTurn {
+				if lastCompletedTurn != nil && config.PrepareNextTurn != nil {
+					update, err := config.PrepareNextTurn(signal, *lastCompletedTurn)
+					if err != nil {
+						return err
+					}
+					if update != nil {
+						if update.Context != nil {
+							currentContext = *update.Context
+						}
+						preparedMessages = update.Messages
+						if update.Model != nil {
+							config.Model = *update.Model
+						}
+						if update.ThinkingLevel != nil {
+							if *update.ThinkingLevel == ai.ThinkingLevelOff {
+								config.Reasoning = nil
+							} else {
+								level := *update.ThinkingLevel
+								config.Reasoning = &level
+							}
+						}
+					}
+					// Preparation can be long-running. Pick up steering queued
+					// while it ran, unless the earlier poll returned some:
+					// one-at-a-time mode would deliver two messages this turn.
+					if len(pendingMessages) == 0 {
+						pendingMessages = config.GetSteeringMessages(signal)
+					}
+				}
 				if err := emit(TurnStartEvent{Type: "turn_start"}); err != nil {
 					return err
 				}
@@ -213,6 +244,9 @@ func RunLoop(
 				firstTurn = false
 			}
 
+			// Prepared and queued messages come before the next assistant
+			// response.
+			pendingMessages = append(append([]AgentMessage(nil), preparedMessages...), pendingMessages...)
 			if len(pendingMessages) > 0 {
 				for _, msg := range pendingMessages {
 					messageID := newMessageID()
@@ -289,12 +323,13 @@ func RunLoop(
 				return err
 			}
 
-			if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(ShouldStopAfterTurnContext{
+			lastCompletedTurn = &PrepareNextTurnContext{
 				Message:     message,
 				ToolResults: toolResults,
 				Context:     currentContext,
 				NewMessages: *newMessages,
-			}) {
+			}
+			if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(*lastCompletedTurn) {
 				if err := emit(EndEvent{
 					Type:     "agent_end",
 					Messages: *newMessages,
@@ -872,7 +907,7 @@ func ExecutePreparedToolCall(
 	}
 	return ExecutedToolCallOutcome{
 		result:  result,
-		isError: false,
+		isError: result.IsError,
 	}, nil
 }
 
@@ -912,6 +947,7 @@ func FinalizeExecutedToolCall(
 			}
 			if afterResult.IsError != nil {
 				isError = *afterResult.IsError
+				result.IsError = isError
 			}
 			if afterResult.Terminate != nil {
 				result.Terminate = afterResult.Terminate

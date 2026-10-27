@@ -2,7 +2,8 @@ go 1.27.3
 
 use (
 	.
-	./baseAgent
 	./agent
 	./ai
+	./baseAgent
+	./mcp
 )

@@ -715,6 +715,66 @@ func TestAgentLoopAfterToolCallCanTerminateBatch(t *testing.T) {
 	}
 }
 
+// A tool can report a failure with a result instead of an error. The result
+// keeps its images and details.
+func TestAgentLoopKeepsErrorResultContentAndDetails(t *testing.T) {
+	tool := echoTool(nil)
+	image := ai.ImageContent{Type: ai.ContentTypeImage, Image: "aW1n", MimeType: "image/png"}
+	tool.Execute = func(context.Context, string, any, AgentToolUpdateCallback[any]) (AgentToolResult[any], error) {
+		return AgentToolResult[any]{
+			Content: []ai.ToolResultContent{ai.TextContent{Type: ai.ContentTypeText, Text: "bad"}, image},
+			Details: map[string]any{"partial": true},
+			IsError: true,
+		}, nil
+	}
+	call := ai.ToolCall{Type: ai.ContentTypeToolCall, Id: "tool-1", Name: "echo", Args: map[string]any{"value": "x"}}
+	run := func(cfg AgentLoopConfig) (ai.ToolResultMessage, ToolExecutionEndEvent) {
+		t.Helper()
+		var end ToolExecutionEndEvent
+		batch, err := ExecuteToolCalls(
+			AgentContext{Tools: []AgentTool[any, any]{tool}},
+			assistantMsg([]ai.AssistantContent{call}, ai.StopReasonToolUse),
+			cfg,
+			context.Background(),
+			func(e AgentEvent) error {
+				if e, ok := e.(ToolExecutionEndEvent); ok {
+					end = e
+				}
+				return nil
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(batch.message) != 1 {
+			t.Fatalf("expected one tool result, got %d", len(batch.message))
+		}
+		return batch.message[0], end
+	}
+
+	resultIsError := func(end ToolExecutionEndEvent) bool { return end.Result.(AgentToolResult[any]).IsError }
+	msg, end := run(baseConfig())
+	if !msg.IsError || !end.IsError || !resultIsError(end) {
+		t.Fatalf("error flags: message %v, end %v, result %v", msg.IsError, end.IsError, resultIsError(end))
+	}
+	if len(msg.Content) != 2 || msg.Content[1] != image {
+		t.Fatalf("content = %#v, want text and image", msg.Content)
+	}
+	if !reflect.DeepEqual(msg.Details, map[string]any{"partial": true}) {
+		t.Fatalf("details = %#v", msg.Details)
+	}
+
+	// afterToolCall can clear the flag, and the result agrees.
+	cfg := baseConfig()
+	cfg.AfterToolCall = func(context.Context, AfterToolCallContext[any]) (*AfterToolCallResult, error) {
+		return &AfterToolCallResult{IsError: boolPtr(false)}, nil
+	}
+	msg, end = run(cfg)
+	if msg.IsError || end.IsError || resultIsError(end) {
+		t.Fatalf("cleared error flags: message %v, end %v, result %v", msg.IsError, end.IsError, resultIsError(end))
+	}
+}
+
 func TestAgentLoopContinueRequiresMessages(t *testing.T) {
 	_, err := AgentLoopContinue(AgentContext{}, baseConfig(), context.Background(), nil)
 	if err == nil || err.Error() != "Cannot continue: no messages in context" {
@@ -769,5 +829,89 @@ func TestAgentLoopContinueAllowsCustomLastMessage(t *testing.T) {
 	}
 	if len(msgs) != 1 || msgs[0].AgentMessageType() != "assistant" {
 		t.Fatalf("msgs=%#v", msgs)
+	}
+}
+
+func TestAgentLoopPrepareNextTurnChangesNextRequest(t *testing.T) {
+	var requests []ai.ModelContext
+	var models []string
+	var reasoning []*ai.ModelThinkingLevel
+	first := assistantMsg([]ai.AssistantContent{ai.ToolCall{Type: ai.ContentTypeToolCall, Id: "tool-1", Name: "echo", Args: map[string]any{"value": "hi"}}}, ai.StopReasonToolUse)
+	replies := []ai.AssistantMessage{first, textAssistant("done")}
+	stream := func(_ context.Context, model ai.Model[ai.API], request ai.ModelContext, options *ai.SimpleStreamOptions) (*ai.AssistantMessageEventStream, error) {
+		requests = append(requests, request)
+		models = append(models, model.ID)
+		reasoning = append(reasoning, options.Reasoning)
+		reply := replies[0]
+		replies = replies[1:]
+		return doneStream(reply), nil
+	}
+
+	echo := echoTool(nil)
+	added := AgentTool[any, any]{Tool: ai.Tool{Name: "added", Parameters: map[string]any{"type": "object"}}}
+	nextModel := testModel()
+	nextModel.ID = "next"
+	high := ai.ThinkingLevelHigh
+	var turns []PrepareNextTurnContext
+	cfg := baseConfig()
+	cfg.PrepareNextTurn = func(_ context.Context, turn PrepareNextTurnContext) (*AgentLoopTurnUpdate, error) {
+		turns = append(turns, turn)
+		context := turn.Context
+		context.Tools = []AgentTool[any, any]{echo, added}
+		return &AgentLoopTurnUpdate{
+			Context:       &context,
+			Messages:      []AgentMessage{userMsg("prepared")},
+			Model:         &nextModel,
+			ThinkingLevel: &high,
+		}, nil
+	}
+
+	msgs, events, err := collectEvents([]AgentMessage{userMsg("go")}, AgentContext{Tools: []AgentTool[any, any]{echo}}, cfg, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 1 || len(turns[0].ToolResults) != 1 || turns[0].ToolResults[0].ToolCallID != "tool-1" {
+		t.Fatalf("PrepareNextTurn got %#v", turns)
+	}
+	if len(requests) != 2 || len(requests[0].Tools) != 1 || len(requests[1].Tools) != 2 || requests[1].Tools[1].Name != "added" {
+		t.Fatalf("tools per request: %d then %d", len(requests[0].Tools), len(requests[1].Tools))
+	}
+	if !reflect.DeepEqual(models, []string{"mock", "next"}) || reasoning[0] != nil || reasoning[1] == nil || *reasoning[1] != high {
+		t.Fatalf("models %v, reasoning %v", models, reasoning)
+	}
+	// The prepared message is part of the run, after the tool result.
+	last := requests[1].Messages[len(requests[1].Messages)-1]
+	if user, ok := last.(ai.UserMessage); !ok || userText(user) != "prepared" {
+		t.Fatalf("last message of the second request = %#v", last)
+	}
+	if user, ok := msgs[3].(ai.UserMessage); !ok || userText(user) != "prepared" || len(msgs) != 5 {
+		t.Fatalf("new messages = %#v", msgs)
+	}
+	want := []string{"agent_start", "turn_start", "message_start", "message_end", "message_start", "message_end",
+		"tool_execution_start", "tool_execution_end", "message_start", "message_end", "turn_end",
+		"turn_start", "message_start", "message_end", "message_start", "message_end", "turn_end", "agent_end"}
+	if !reflect.DeepEqual(eventTypes(events), want) {
+		t.Fatalf("events %v", eventTypes(events))
+	}
+}
+
+func TestAgentLoopPrepareNextTurnErrorEndsRun(t *testing.T) {
+	first := assistantMsg([]ai.AssistantContent{ai.ToolCall{Type: ai.ContentTypeToolCall, Id: "tool-1", Name: "echo", Args: map[string]any{"value": "hi"}}}, ai.StopReasonToolUse)
+	cfg := baseConfig()
+	failure := errors.New("prepare failed")
+	cfg.PrepareNextTurn = func(context.Context, PrepareNextTurnContext) (*AgentLoopTurnUpdate, error) { return nil, failure }
+	_, _, err := collectEvents([]AgentMessage{userMsg("go")}, AgentContext{Tools: []AgentTool[any, any]{echoTool(nil)}}, cfg, streamSeq(first, textAssistant("unreached")))
+	if !errors.Is(err, failure) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestAgentSetToolsAppliesToNextRunAndCopies(t *testing.T) {
+	agent := NewAgent(nil)
+	tools := []AgentTool[any, any]{echoTool(nil)}
+	agent.SetTools(tools)
+	tools[0] = AgentTool[any, any]{Tool: ai.Tool{Name: "changed"}}
+	if got := agent.State().Tools; len(got) != 1 || got[0].Name != "echo" {
+		t.Fatalf("tools = %#v", got)
 	}
 }

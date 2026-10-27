@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -595,20 +596,58 @@ func ConvertResponsesMessages(model Model[API], modelContext ModelContext, provi
 				}
 			}
 		case ToolResultMessage:
-			var output strings.Builder
-			for _, part := range m.Content {
-				if p, ok := part.(TextContent); ok {
-					output.WriteString(p.Text)
-				}
-			}
 			callID := m.ToolCallID
 			if parts := strings.SplitN(callID, "|", 2); len(parts) == 2 {
 				callID = parts[0]
 			}
-			messages = append(messages, responses.ResponseInputItemParamOfFunctionCallOutput(callID, output.String()))
+			messages = append(messages, convertToolResultOutput(model, callID, m.Content))
 		}
 	}
 	return messages, nil
+}
+
+// convertToolResultOutput is the function_call_output of a tool result: its
+// text, or for a model that takes images, its text and images as input parts.
+func convertToolResultOutput(model Model[API], callID string, content []ToolResultContent) responses.ResponseInputItemUnionParam {
+	var texts []string
+	var images []ImageContent
+	for _, part := range content {
+		switch p := part.(type) {
+		case TextContent:
+			texts = append(texts, p.Text)
+		case ImageContent:
+			images = append(images, p)
+		}
+	}
+	text := strings.Join(texts, "\n")
+	hasText := strings.TrimSpace(text) != ""
+
+	if len(images) == 0 || !slices.Contains(model.Input, "image") {
+		switch {
+		case hasText:
+		case len(images) > 0:
+			text = "(see attached image)"
+		default:
+			text = "(no tool output)"
+		}
+		return responses.ResponseInputItemParamOfFunctionCallOutput(callID, text)
+	}
+
+	output := make(responses.ResponseFunctionCallOutputItemListParam, 0, len(images)+1)
+	if hasText {
+		output = append(output, responses.ResponseFunctionCallOutputItemUnionParam{
+			OfInputText: &responses.ResponseInputTextContentParam{Text: text},
+		})
+	}
+	for _, image := range images {
+		output = append(output, responses.ResponseFunctionCallOutputItemUnionParam{
+			OfInputImage: &responses.ResponseInputImageContentParam{
+				Detail:   responses.ResponseInputImageContentDetailAuto,
+				ImageURL: param.NewOpt("data:" + image.MimeType + ";base64," + image.Image),
+			},
+		})
+	}
+	return responses.ResponseInputItemParamOfFunctionCallOutput(callID, output)
 }
 
 func normalizeIDPart(part string) string {

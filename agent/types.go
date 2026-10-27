@@ -62,8 +62,12 @@ type AfterToolCallResult struct {
 }
 
 type AgentToolResult[TDetails any] struct {
-	Content   []ai.ToolResultContent
-	Details   TDetails
+	Content []ai.ToolResultContent
+	Details TDetails
+	// IsError reports a failure without returning an error. The model sees
+	// Content as an error result, like a returned error, but Content keeps
+	// its images and Details are kept for the UI.
+	IsError   bool
 	Terminate *bool
 }
 
@@ -112,12 +116,50 @@ type ShouldStopAfterTurnContext struct {
 	NewMessages []AgentMessage
 }
 
+// PrepareNextTurnContext is the turn that just completed, passed to
+// PrepareNextTurn before the next one starts.
+type PrepareNextTurnContext = ShouldStopAfterTurnContext
+
+// AgentLoopTurnUpdate changes the next turn of a run. Nil fields keep the
+// current value.
+type AgentLoopTurnUpdate struct {
+	// Context for the next provider request, such as one with other tools.
+	Context *AgentContext
+	// Messages to append before the next provider request, with normal
+	// lifecycle events.
+	Messages []AgentMessage
+	// Model for the next provider request.
+	Model *ai.Model[ai.API]
+	// ThinkingLevel for the next provider request.
+	ThinkingLevel *ai.ModelThinkingLevel
+}
+
+// ToolAnnotations are hints about a tool's behavior, such as those of MCP
+// tools. Nil means unknown. They are hints: do not rely on them for
+// security.
+type ToolAnnotations struct {
+	// ReadOnlyHint: the tool does not change its environment.
+	ReadOnlyHint *bool `json:"readOnlyHint,omitempty"`
+	// DestructiveHint: the tool may make destructive changes, not only
+	// additive ones.
+	DestructiveHint *bool `json:"destructiveHint,omitempty"`
+	// IdempotentHint: calling the tool again with the same arguments has no
+	// further effect.
+	IdempotentHint *bool `json:"idempotentHint,omitempty"`
+	// OpenWorldHint: the tool interacts with an open world of external
+	// entities, such as the web.
+	OpenWorldHint *bool `json:"openWorldHint,omitempty"`
+}
+
 type AgentTool[TParameters any, TDetails any] struct {
 	ai.Tool
 	Label string
 	// Optional compatibility shim for raw tool-call arguments before validation.
 	PrepareArguments func(args any) (TParameters, error)
-	/** Execute the tool call. Throw on failure instead of encoding errors in `content`. */
+	/**
+	 * Execute the tool call. Return an error on failure, or a result with
+	 * IsError set; do not only describe the failure in `content`.
+	 */
 	Execute func(
 		ctx context.Context,
 		toolCallID string,
@@ -125,6 +167,9 @@ type AgentTool[TParameters any, TDetails any] struct {
 		onUpdate AgentToolUpdateCallback[TDetails],
 	) (AgentToolResult[TDetails], error)
 	ToolExecutionMode *ToolExecutionMode
+	// Annotations are optional hints about the tool's behavior, for apps
+	// that ask before running some tools. The model does not see them.
+	Annotations *ToolAnnotations
 }
 
 // AgentMessage is the union of LLM message types (user, assistant, system)
@@ -146,6 +191,10 @@ type AgentLoopConfig struct {
 	TransformContext    TransformContextFunc `json:"transform_context"`
 	ResolveAuth         func(ctx context.Context, model ai.Model[ai.API]) (ai.ModelAuth, error)
 	ShouldStopAfterTurn func(ctx ShouldStopAfterTurnContext) bool
+	// PrepareNextTurn runs after a turn completes and before the next one
+	// starts, and may change the next turn, for example its tools. An error
+	// ends the run.
+	PrepareNextTurn     func(ctx context.Context, turn PrepareNextTurnContext) (*AgentLoopTurnUpdate, error)
 	GetSteeringMessages func(ctx context.Context) []AgentMessage
 	GetFollowUpMessages func(ctx context.Context) []AgentMessage
 	ToolExecution       *ToolExecutionMode

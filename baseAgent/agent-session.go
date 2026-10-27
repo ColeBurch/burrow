@@ -148,16 +148,61 @@ type AgentSession struct {
 	manualCompactionDone chan struct{}
 	unsubscribeAgent     func()
 	eventListeners       []*AgentSessionEventListener
+
+	// toolsMu guards toolRegistry, every tool that can be activated, by
+	// name, and toolOrder, their names in registration order.
+	toolsMu      sync.Mutex
+	toolRegistry map[string]agent.AgentTool[any, any]
+	toolOrder    []string
 }
 
+// NewAgentSession wraps a. The agent's tools are registered and active. Its
+// PrepareNextTurn is wrapped so each turn of a run uses the active tools,
+// model and thinking level of that moment.
 func NewAgentSession(a *agent.Agent, sm *SessionManager) *AgentSession {
 	session := &AgentSession{
 		Agent:              a,
 		SessionManager:     sm,
 		compactionSettings: DEFAULT_COMPACTION_SETTINGS,
+		toolRegistry:       map[string]agent.AgentTool[any, any]{},
+	}
+	if a != nil {
+		for _, tool := range a.State().Tools {
+			session.addToRegistry(tool)
+		}
+		session.installPrepareNextTurn()
 	}
 	session.subscribeToAgentEvents()
 	return session
+}
+
+// installPrepareNextTurn gives every turn after the first the agent's
+// current tools, model and thinking level, so tools registered or activated
+// during a run reach its next turn.
+func (s *AgentSession) installPrepareNextTurn() {
+	previous := s.Agent.PrepareNextTurn
+	s.Agent.PrepareNextTurn = func(ctx context.Context, turn agent.PrepareNextTurnContext) (*agent.AgentLoopTurnUpdate, error) {
+		update := &agent.AgentLoopTurnUpdate{}
+		if previous != nil {
+			previousUpdate, err := previous(ctx, turn)
+			if err != nil {
+				return nil, err
+			}
+			if previousUpdate != nil {
+				update = previousUpdate
+			}
+		}
+		next := turn.Context
+		if update.Context != nil {
+			next = *update.Context
+		}
+		state := s.Agent.State()
+		next.Tools = state.Tools
+		update.Context = &next
+		update.Model = &state.Model
+		update.ThinkingLevel = &state.ThinkingLevel
+		return update, nil
+	}
 }
 
 // ============================================================================
@@ -328,6 +373,102 @@ func (s *AgentSession) GetActiveToolNames() ([]string, error) {
 		names = append(names, tool.Name)
 	}
 	return names, nil
+}
+
+// ToolInfo describes a registered tool.
+type ToolInfo struct {
+	Name        string
+	Description string
+	Parameters  map[string]any
+	Annotations *agent.ToolAnnotations
+}
+
+// GetAllTools returns every registered tool, active or not, in registration
+// order.
+func (s *AgentSession) GetAllTools() []ToolInfo {
+	s.toolsMu.Lock()
+	defer s.toolsMu.Unlock()
+	infos := make([]ToolInfo, 0, len(s.toolOrder))
+	for _, name := range s.toolOrder {
+		tool := s.toolRegistry[name]
+		infos = append(infos, ToolInfo{
+			Name:        tool.Name,
+			Description: tool.Description,
+			Parameters:  tool.Parameters,
+			Annotations: tool.Annotations,
+		})
+	}
+	return infos
+}
+
+// RegisterTool adds tool to the registry, or replaces the registered tool
+// with its name. A new tool becomes active. A replaced tool stays active or
+// inactive; when active, the agent gets the new version. Changes reach a
+// running prompt at its next turn.
+func (s *AgentSession) RegisterTool(tool agent.AgentTool[any, any]) error {
+	if s.Agent == nil {
+		return errors.New("no agent set")
+	}
+	if tool.Name == "" {
+		return errors.New("tool name is required")
+	}
+	s.toolsMu.Lock()
+	defer s.toolsMu.Unlock()
+	_, registered := s.toolRegistry[tool.Name]
+	s.addToRegistry(tool)
+	active := s.activeToolNames()
+	if !registered {
+		active = append(active, tool.Name)
+	}
+	s.setActiveTools(active)
+	return nil
+}
+
+// SetActiveToolsByName sets the active tools, the ones declared to the
+// model. Only registered tools can be activated; unknown names are ignored.
+// Changes reach a running prompt at its next turn.
+func (s *AgentSession) SetActiveToolsByName(names []string) error {
+	if s.Agent == nil {
+		return errors.New("no agent set")
+	}
+	s.toolsMu.Lock()
+	defer s.toolsMu.Unlock()
+	s.setActiveTools(names)
+	return nil
+}
+
+// addToRegistry adds or replaces tool. Callers hold toolsMu, except during
+// construction.
+func (s *AgentSession) addToRegistry(tool agent.AgentTool[any, any]) {
+	if _, ok := s.toolRegistry[tool.Name]; !ok {
+		s.toolOrder = append(s.toolOrder, tool.Name)
+	}
+	s.toolRegistry[tool.Name] = tool
+}
+
+func (s *AgentSession) activeToolNames() []string {
+	tools := s.Agent.State().Tools
+	names := make([]string, len(tools))
+	for i, tool := range tools {
+		names[i] = tool.Name
+	}
+	return names
+}
+
+// setActiveTools gives the agent the registered tools named, each once, in
+// order. Callers hold toolsMu.
+func (s *AgentSession) setActiveTools(names []string) {
+	seen := map[string]bool{}
+	tools := make([]agent.AgentTool[any, any], 0, len(names))
+	for _, name := range names {
+		tool, ok := s.toolRegistry[name]
+		if !ok || seen[name] {
+			continue
+		}
+		seen[name] = true
+		tools = append(tools, tool)
+	}
+	s.Agent.SetTools(tools)
 }
 
 /** Current messages in the conversation */

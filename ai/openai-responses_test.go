@@ -809,3 +809,38 @@ func TestConvertResponsesMessagesGivesUnsignedTextUniqueIDs(t *testing.T) {
 		t.Errorf("signed text ID = %q, want its signature's msg_api", ids[3])
 	}
 }
+
+func TestConvertToolResultOutput(t *testing.T) {
+	text := func(s string) TextContent { return TextContent{Type: ContentTypeText, Text: s} }
+	image := ImageContent{Type: ContentTypeImage, Image: "aW1n", MimeType: "image/png"}
+	textModel := testResponsesModel()
+	textModel.Input = []string{"text"}
+	visionModel := testResponsesModel()
+	visionModel.Input = []string{"text", "image"}
+
+	cases := []struct {
+		name    string
+		model   Model[API]
+		content []ToolResultContent
+		want    string
+	}{
+		{"joins text with newlines", visionModel, []ToolResultContent{text("a"), text("b")}, "a\nb"},
+		{"empty", visionModel, nil, "(no tool output)"},
+		{"blank text", visionModel, []ToolResultContent{text("  ")}, "(no tool output)"},
+		{"image for text model", textModel, []ToolResultContent{image}, "(see attached image)"},
+		{"text and image for text model", textModel, []ToolResultContent{text("a"), image}, "a"},
+	}
+	for _, c := range cases {
+		item := convertToolResultOutput(c.model, "call_1", c.content)
+		output := item.OfFunctionCallOutput.Output
+		if !output.OfString.Valid() || output.OfString.Value != c.want {
+			t.Errorf("%s: output = %#v, want string %q", c.name, output, c.want)
+		}
+	}
+
+	item := convertToolResultOutput(visionModel, "call_1", []ToolResultContent{image})
+	parts := item.OfFunctionCallOutput.Output.OfResponseFunctionCallOutputItemArray
+	if len(parts) != 1 || parts[0].OfInputImage == nil {
+		t.Fatalf("image-only output = %#v, want one image part", item.OfFunctionCallOutput.Output)
+	}
+}

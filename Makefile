@@ -1,7 +1,7 @@
 SHELL := /bin/sh
 
-MODULES := ai agent baseAgent
-PACKAGES := ./ai/... ./agent/... ./baseAgent/...
+MODULES := ai agent baseAgent mcp
+PACKAGES := ./ai/... ./agent/... ./baseAgent/... ./mcp/...
 REMOTE ?= origin
 RELEASE_BRANCH ?= main
 
@@ -12,7 +12,7 @@ RELEASE_BRANCH ?= main
 	bump bump-patch bump-minor bump-major \
 	tag tag-patch tag-minor tag-major publish
 
-# This macro sets ai_version, agent_version, and base_agent_version.
+# This macro sets ai_version, agent_version, base_agent_version, and mcp_version.
 define compute_next_versions
 next_version() { \
 	module="$$1"; \
@@ -36,7 +36,8 @@ next_version() { \
 }; \
 ai_version=$$(next_version ai); \
 agent_version=$$(next_version agent); \
-base_agent_version=$$(next_version baseAgent)
+base_agent_version=$$(next_version baseAgent); \
+mcp_version=$$(next_version mcp)
 endef
 
 # Go requires a /vN module-path suffix for major versions after v1.
@@ -56,7 +57,8 @@ validate_major_path() { \
 }; \
 validate_major_path ai "$$ai_version"; \
 validate_major_path agent "$$agent_version"; \
-validate_major_path baseAgent "$$base_agent_version"
+validate_major_path baseAgent "$$base_agent_version"; \
+validate_major_path mcp "$$mcp_version"
 endef
 
 help:
@@ -172,16 +174,22 @@ bump:
 	$(validate_major_paths); \
 	ai_path=$$(awk '$$1 == "module" { print $$2; exit }' ai/go.mod); \
 	agent_path=$$(awk '$$1 == "module" { print $$2; exit }' agent/go.mod); \
+	base_agent_path=$$(awk '$$1 == "module" { print $$2; exit }' baseAgent/go.mod); \
 	(cd agent && go mod edit -require="$$ai_path@v$$ai_version"); \
 	(cd baseAgent && go mod edit \
 		-require="$$ai_path@v$$ai_version" \
 		-require="$$agent_path@v$$agent_version"); \
+	(cd mcp && go mod edit \
+		-require="$$ai_path@v$$ai_version" \
+		-require="$$agent_path@v$$agent_version" \
+		-require="$$base_agent_path@v$$base_agent_version"); \
 	if [ -f vendor/modules.txt ]; then go work vendor; fi; \
 	printf 'Prepared internal module requirements.\n\n'; \
 	printf 'Planned tags:\n'; \
 	printf '  ai/v%s\n' "$$ai_version"; \
 	printf '  agent/v%s\n' "$$agent_version"; \
 	printf '  baseAgent/v%s\n' "$$base_agent_version"; \
+	printf '  mcp/v%s\n' "$$mcp_version"; \
 	printf '\nCommit the go.mod changes before you create the tags.\n'
 
 tag-patch:
@@ -208,9 +216,13 @@ tag: check
 	$(validate_major_paths); \
 	ai_path=$$(awk '$$1 == "module" { print $$2; exit }' ai/go.mod); \
 	agent_path=$$(awk '$$1 == "module" { print $$2; exit }' agent/go.mod); \
+	base_agent_path=$$(awk '$$1 == "module" { print $$2; exit }' baseAgent/go.mod); \
 	agent_ai_version=$$(cd agent && GOWORK=off go list -m -f '{{.Version}}' "$$ai_path"); \
 	base_ai_version=$$(cd baseAgent && GOWORK=off go list -m -f '{{.Version}}' "$$ai_path"); \
 	base_agent_version_required=$$(cd baseAgent && GOWORK=off go list -m -f '{{.Version}}' "$$agent_path"); \
+	mcp_ai_version=$$(cd mcp && GOWORK=off go list -m -f '{{.Version}}' "$$ai_path"); \
+	mcp_agent_version=$$(cd mcp && GOWORK=off go list -m -f '{{.Version}}' "$$agent_path"); \
+	mcp_base_agent_version=$$(cd mcp && GOWORK=off go list -m -f '{{.Version}}' "$$base_agent_path"); \
 	if [ "$$agent_ai_version" != "v$$ai_version" ]; then \
 		printf 'agent/go.mod requires %s. Expected v%s.\n' "$$agent_ai_version" "$$ai_version" >&2; \
 		exit 1; \
@@ -223,7 +235,19 @@ tag: check
 		printf 'baseAgent/go.mod requires %s. Expected v%s.\n' "$$base_agent_version_required" "$$agent_version" >&2; \
 		exit 1; \
 	fi; \
-	for tag in "ai/v$$ai_version" "agent/v$$agent_version" "baseAgent/v$$base_agent_version"; do \
+	if [ "$$mcp_ai_version" != "v$$ai_version" ]; then \
+		printf 'mcp/go.mod requires ai %s. Expected v%s.\n' "$$mcp_ai_version" "$$ai_version" >&2; \
+		exit 1; \
+	fi; \
+	if [ "$$mcp_agent_version" != "v$$agent_version" ]; then \
+		printf 'mcp/go.mod requires agent %s. Expected v%s.\n' "$$mcp_agent_version" "$$agent_version" >&2; \
+		exit 1; \
+	fi; \
+	if [ "$$mcp_base_agent_version" != "v$$base_agent_version" ]; then \
+		printf 'mcp/go.mod requires baseAgent %s. Expected v%s.\n' "$$mcp_base_agent_version" "$$base_agent_version" >&2; \
+		exit 1; \
+	fi; \
+	for tag in "ai/v$$ai_version" "agent/v$$agent_version" "baseAgent/v$$base_agent_version" "mcp/v$$mcp_version"; do \
 		if git rev-parse -q --verify "refs/tags/$$tag" >/dev/null; then \
 			printf 'Tag already exists: %s\n' "$$tag" >&2; \
 			exit 1; \
@@ -232,10 +256,12 @@ tag: check
 	git tag "ai/v$$ai_version"; \
 	git tag "agent/v$$agent_version"; \
 	git tag "baseAgent/v$$base_agent_version"; \
+	git tag "mcp/v$$mcp_version"; \
 	printf 'Created tags:\n'; \
 	printf '  ai/v%s\n' "$$ai_version"; \
 	printf '  agent/v%s\n' "$$agent_version"; \
-	printf '  baseAgent/v%s\n' "$$base_agent_version"
+	printf '  baseAgent/v%s\n' "$$base_agent_version"; \
+	printf '  mcp/v%s\n' "$$mcp_version"
 
 publish:
 	@set -eu; \

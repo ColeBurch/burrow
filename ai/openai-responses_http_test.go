@@ -199,6 +199,50 @@ func TestStreamOpenAIResponseOverHTTPRoundTripsToolCall(t *testing.T) {
 	}
 }
 
+// A tool result with an image reaches a vision model as input parts.
+func TestStreamOpenAIResponseOverHTTPSendsToolResultImages(t *testing.T) {
+	server := providertest.NewServer(t, providertest.Sequence(t,
+		oair.Reply(oair.Text("msg_1", "A cat."), oair.Completed("resp_1", oair.Usage{Input: 9, Output: 2})),
+	))
+	model := oair.Model()
+	model.Input = []string{"text", "image"}
+	call := ai.ToolCall{Type: ai.ContentTypeToolCall, Id: "call_1|fc_1", Name: "screenshot", Args: map[string]any{}}
+	modelContext := ai.ModelContext{Messages: []ai.Message{
+		userText("What is on screen?"),
+		ai.AssistantMessage{
+			Role: ai.RoleAssistant, Api: model.API, Provider: model.Provider, Model: model.ID,
+			Content: []ai.AssistantContent{call}, StopReason: ai.StopReasonToolUse,
+		},
+		ai.ToolResultMessage{
+			Role: ai.RoleToolResult, ToolCallID: call.Id, ToolName: call.Name,
+			Content: []ai.ToolResultContent{
+				ai.TextContent{Type: ai.ContentTypeText, Text: "Captured"},
+				ai.ImageContent{Type: ai.ContentTypeImage, Image: "aW1n", MimeType: "image/png"},
+			},
+		},
+	}}
+	if _, _, err := streamFromServer(t, t.Context(), server, model, modelContext, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	outputs := oair.InputItems(t, server.Requests()[0], "function_call_output")
+	if len(outputs) != 1 || outputs[0]["call_id"] != "call_1" {
+		t.Fatalf("function_call_output items = %#v", outputs)
+	}
+	parts, ok := outputs[0]["output"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("output = %#v, want text and image parts", outputs[0]["output"])
+	}
+	textPart, _ := parts[0].(map[string]any)
+	imagePart, _ := parts[1].(map[string]any)
+	if textPart["type"] != "input_text" || textPart["text"] != "Captured" {
+		t.Errorf("text part = %#v", textPart)
+	}
+	if imagePart["type"] != "input_image" || imagePart["image_url"] != "data:image/png;base64,aW1n" || imagePart["detail"] != "auto" {
+		t.Errorf("image part = %#v", imagePart)
+	}
+}
+
 // With store=false the API keeps no reasoning state, so the encrypted reasoning
 // from one turn must be sent back on the next.
 func TestStreamOpenAIResponseOverHTTPRoundTripsReasoning(t *testing.T) {

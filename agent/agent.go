@@ -155,6 +155,10 @@ type AgentOptions struct {
 		call AfterToolCallContext[any],
 	) (*AfterToolCallResult, error)
 
+	// PrepareNextTurn runs before every turn of a run but the first, and may
+	// change it; see AgentLoopConfig.PrepareNextTurn.
+	PrepareNextTurn func(ctx context.Context, turn PrepareNextTurnContext) (*AgentLoopTurnUpdate, error)
+
 	SteeringMode QueueMode
 	FollowUpMode QueueMode
 
@@ -273,8 +277,9 @@ type Agent struct {
 	OnPayload  func(payload any, model ai.Model[ai.API]) (any, error)
 	OnResponse func(response ai.ProviderResponse, model ai.Model[ai.API]) error
 
-	BeforeToolCall func(context.Context, BeforeToolCallContext) (*BeforeToolCallResult, error)
-	AfterToolCall  func(context.Context, AfterToolCallContext[any]) (*AfterToolCallResult, error)
+	BeforeToolCall  func(context.Context, BeforeToolCallContext) (*BeforeToolCallResult, error)
+	AfterToolCall   func(context.Context, AfterToolCallContext[any]) (*AfterToolCallResult, error)
+	PrepareNextTurn func(context.Context, PrepareNextTurnContext) (*AgentLoopTurnUpdate, error)
 
 	activeRun *ActiveRun
 
@@ -335,6 +340,7 @@ func NewAgent(options *AgentOptions) *Agent {
 		OnResponse:       options.OnResponse,
 		BeforeToolCall:   options.BeforeToolCall,
 		AfterToolCall:    options.AfterToolCall,
+		PrepareNextTurn:  options.PrepareNextTurn,
 		SessionID:        options.SessionID,
 		ThinkingBudgets:  options.ThinkingBudgets,
 		Transport:        transport,
@@ -390,6 +396,15 @@ func (a *Agent) ReplaceMessages(messages []AgentMessage) error {
 
 	a.state.Messages = append([]AgentMessage(nil), messages...)
 	return nil
+}
+
+// SetTools replaces the agent's tools. The top-level slice is copied. A run
+// in progress keeps the tools it started with unless PrepareNextTurn gives
+// its next turn these.
+func (a *Agent) SetTools(tools []AgentTool[any, any]) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.state.Tools = append([]AgentTool[any, any](nil), tools...)
 }
 
 func (a *Agent) SteeringMode() QueueMode {
@@ -630,6 +645,7 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 		ToolExecution:    &toolExecution,
 		BeforeToolCall:   a.BeforeToolCall,
 		AfterToolCall:    a.AfterToolCall,
+		PrepareNextTurn:  a.PrepareNextTurn,
 		GetSteeringMessages: func(ctx context.Context) []AgentMessage {
 			if skip {
 				skip = false
